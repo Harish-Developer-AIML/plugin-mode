@@ -1301,6 +1301,18 @@ def write_settings(updates, remove_keys):
     return backup
 
 
+def read_secret_line():
+    """First line of stdin as the secret. Read as bytes and decoded as UTF-8 with any BOM
+    removed: Windows PowerShell 5.1 puts a BOM in front of text it pipes to a program, and
+    text-mode stdin on Windows would decode with the ANSI code page."""
+    stream = getattr(sys.stdin, "buffer", None)
+    if stream is None:
+        line = sys.stdin.readline()
+    else:
+        line = stream.readline().decode("utf-8-sig", "replace")
+    return line.lstrip("\ufeff").strip()
+
+
 def setup_main(args):
     interactive = sys.stdin.isatty() and not args.secret_stdin
     host = args.host
@@ -1312,7 +1324,7 @@ def setup_main(args):
             public_key = input("Public key (pk-ag-...): ").strip()
         secret = getpass.getpass("Secret key (sk-ag-..., hidden): ").strip()
     else:
-        secret = sys.stdin.readline().strip() if args.secret_stdin else (os.environ.get("AGENTGUARD_SECRET_KEY") or "").strip()
+        secret = read_secret_line() if args.secret_stdin else (os.environ.get("AGENTGUARD_SECRET_KEY") or "").strip()
     host = (host or DEFAULT_HOST).strip().rstrip("/")
     if not re.match(r"^https?://[^\s/]+", host):
         print("ERROR: host must start with https:// (got %r)" % host)

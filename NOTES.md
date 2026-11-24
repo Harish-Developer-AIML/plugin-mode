@@ -323,3 +323,24 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
 - That Claude Code runs the hook command text the way the CI emulation does
   (`-NoProfile -NonInteractive -Command`), with and without Git Bash.
 - A real session: install, setup (terminal and paste), status, and data in AgentGuard.
+
+### First CI run (run 45454945602) and fixes
+
+- Ubuntu passed on 3.8 and 3.12. The macOS jobs were cancelled by hand before running.
+  Windows failed one test on both Pythons:
+  `PsLauncherFileTests.test_status_and_setup_with_real_python` under **Windows PowerShell 5.1
+  only** (pwsh passed). `--setup --secret-stdin` got HTTP 401: the secret arrived with a UTF-8
+  BOM, which 5.1 puts in front of text it pipes to a program. `str.strip()` does not remove
+  it. Every hook test, including PowerShell 5.1 hook mode, passed, because hook stdin was
+  already decoded as `utf-8-sig`.
+- Fix: `--secret-stdin` now reads bytes and decodes them as `utf-8-sig`, dropping any BOM.
+  A new test sends a BOM and CRLF on every platform; it fails with the old code (same 401)
+  and passes now. This would have hit real Windows users who chose the paste option.
+- Both launchers now try **every** match on PATH, not only the first. Otherwise a Store
+  shortcut earlier on PATH hid a real `python3` later on PATH. New tests cover this for both
+  launchers.
+- CI: job logs need a signed-in user, so failures are now also written as annotations, which
+  are public, by `.github/scripts/annotate_failures.py`. The shells and Pythons found on
+  PATH are written as a notice. The fake server no longer prints a traceback when a timed-out
+  client hangs up (Windows `ConnectionAbortedError`). `actions/checkout@v5`; uv cache off.
+

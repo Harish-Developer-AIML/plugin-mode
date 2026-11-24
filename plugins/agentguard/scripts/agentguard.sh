@@ -28,14 +28,29 @@ is_store_stub() {
 }
 
 find_python() {
-    # $1: command name, $2: optional first argument (the "-3" of "py -3")
-    path=$(command -v "$1" 2>/dev/null) || return 1
-    [ -n "$path" ] || return 1
-    is_store_stub "$path" && return 1
-    "$path" ${2:+"$2"} -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' </dev/null >/dev/null 2>&1 || return 1
-    py=$path
-    py_arg=$2
-    return 0
+    # $1: command name, $2: optional first argument (the "-3" of "py -3").
+    # Every PATH entry is tried in order, not just the first match: on Windows the Store
+    # shortcut often comes before a real Python of the same name.
+    saved_ifs=$IFS
+    set -f  # split PATH on ":" without glob-expanding it; the list is fixed when the loop starts
+    IFS=:
+    for dir in $PATH; do
+        IFS=$saved_ifs
+        set +f  # is_store_stub needs globbing
+        [ -n "$dir" ] || dir=.
+        for path in "$dir/$1" "$dir/$1.exe"; do
+            [ -f "$path" ] && [ -x "$path" ] || continue
+            is_store_stub "$path" && continue
+            if "$path" ${2:+"$2"} -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' </dev/null >/dev/null 2>&1; then
+                py=$path
+                py_arg=$2
+                return 0
+            fi
+        done
+    done
+    IFS=$saved_ifs
+    set +f
+    return 1
 }
 
 if find_python python3 || find_python python || find_python py -3; then

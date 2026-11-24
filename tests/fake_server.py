@@ -11,6 +11,16 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
+class QuietHTTPServer(HTTPServer):
+    """Ignores clients that hang up before the answer is written: the timeout tests do that
+    on purpose, and Windows reports it as ConnectionAbortedError."""
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)):
+            return
+        HTTPServer.handle_error(self, request, client_address)
+
+
 class FakeAgentGuard(object):
     """Records requests. `status`, `delay` and `event_errors` control the answers."""
 
@@ -70,7 +80,7 @@ class FakeAgentGuard(object):
                         successes.append({"id": ev["id"], "status": 201})
                 return self._reply(owner.status, {"successes": successes, "errors": errors})
 
-        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = QuietHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     @property
@@ -98,7 +108,7 @@ if __name__ == "__main__":
     srv = FakeAgentGuard()
     if len(sys.argv) > 1:
         srv.server.server_close()
-        srv.server = HTTPServer(("127.0.0.1", int(sys.argv[1])), srv.server.RequestHandlerClass)
+        srv.server = QuietHTTPServer(("127.0.0.1", int(sys.argv[1])), srv.server.RequestHandlerClass)
     srv.start()
     print("fake AgentGuard at %s (public key %s, secret %s)" % (srv.url, srv.public_key, srv.secret_key))
     seen = 0

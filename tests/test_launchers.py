@@ -153,6 +153,17 @@ class ShLauncherTests(Base):
         self.assertIn(b"AgentGuard plugin", p.stdout)
         self.assertFalse([c for c in self.shims.raw_calls() if c.startswith("python3")], self.shims.raw_calls())
 
+    def test_store_stub_earlier_on_path_does_not_hide_a_real_python3(self):
+        store = ShimDir(self.tmp, os.path.join("Local", "Microsoft", "WindowsApps"))
+        store.log = self.shims.log
+        store.add("python3", "crash")
+        self.shims.add("python3", "good")  # same name, later on PATH
+        p = self.run_launcher(["--status"], path=store.dir + os.pathsep + self.shims.dir)
+        self.assertIn(b"AgentGuard plugin", p.stdout, p.stdout + p.stderr)
+        calls = self.shims.raw_calls()
+        self.assertTrue(calls and all(c.startswith("python3 ") for c in calls), calls)
+        self.assertEqual(len([c for c in calls if "send_trace.py" in c]), 1)
+
     def test_store_python_that_is_installed_is_used(self):
         store = ShimDir(self.tmp, os.path.join("Local", "Microsoft", "WindowsApps"))
         store.log = self.shims.log
@@ -239,6 +250,17 @@ class PsLauncherShimTests(Base):
         p = self.run_ps(["--status"], path=store.dir + os.pathsep + self.shims.dir)
         self.assertIn(b"AgentGuard plugin", p.stdout, p.stdout + p.stderr)
         self.assertFalse([c for c in self.shims.raw_calls() if c.startswith("python3")])
+
+    def test_store_stub_earlier_on_path_does_not_hide_a_real_python3(self):
+        store = ShimDir(self.tmp, os.path.join("Local", "Microsoft", "WindowsApps"))
+        store.log = self.shims.log
+        store.add("python3", "crash")
+        self.shims.add("python3", "good")  # same name, later on PATH
+        p = self.run_ps(["--status"], path=store.dir + os.pathsep + self.shims.dir)
+        self.assertIn(b"AgentGuard plugin", p.stdout, p.stdout + p.stderr)
+        calls = self.shims.raw_calls()
+        self.assertTrue(calls and all(c.startswith("python3 ") for c in calls), calls)
+        self.assertEqual(len([c for c in calls if "send_trace.py" in c]), 1)
 
     def test_no_python(self):
         p = self.run_ps(["--status"])

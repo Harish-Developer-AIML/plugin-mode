@@ -982,6 +982,13 @@ class SetupAndStatusTests(Base):
         self.assertIn("OTEL_EXPORTER_OTLP_ENDPOINT", s["env"])
         self.assertTrue(os.path.exists(os.path.join(self.claude_dir, "settings.json.agentguard-backup")))
 
+    def test_secret_on_stdin_with_bom_and_crlf(self):
+        # Windows PowerShell 5.1 pipes text with a UTF-8 BOM and CRLF line endings
+        p = subprocess.run([sys.executable, SCRIPT, "--setup", "--host", self.server.url, "--public-key", self.server.public_key, "--secret-stdin"], input=b"\xef\xbb\xbf" + self.server.secret_key.encode() + b"\r\n", env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn(b"OK: keys work", p.stdout)
+        self.assertEqual(self.settings()["env"]["AGENTGUARD_SECRET_KEY"], self.server.secret_key)
+
     def test_setup_removes_otel_when_asked(self):
         self.write_settings({"env": {"FOO": "bar", "OTEL_EXPORTER_OTLP_ENDPOINT": "http://x", "OTEL_EXPORTER_OTLP_HEADERS": "a=b", "CLAUDE_CODE_ENABLE_TELEMETRY": "1"}})
         p = self.run_cli(["--setup", "--host", self.server.url, "--public-key", self.server.public_key, "--secret-stdin", "--remove-otel"], stdin=self.server.secret_key + "\n")

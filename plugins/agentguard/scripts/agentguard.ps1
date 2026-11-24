@@ -30,15 +30,18 @@ function Test-StoreStub([string]$path) {
 $py = $null
 $pre = @()
 foreach ($candidate in @(@('python3'), @('python'), @('py', '-3'))) {
-    $cmd = Get-Command -Name $candidate[0] -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $cmd) { continue }
-    $path = $cmd.Path
-    if (-not $path) { $path = $cmd.Definition }
-    if (Test-StoreStub $path) { continue }
     $extra = @($candidate | Select-Object -Skip 1)
-    $global:LASTEXITCODE = 1
-    $null | & $path @extra -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' *> $null
-    if ($LASTEXITCODE -eq 0) { $py = $path; $pre = $extra; break }
+    # -All: every match on PATH in order, not just the first. On Windows the Store shortcut
+    # often comes before a real Python of the same name.
+    foreach ($cmd in @(Get-Command -Name $candidate[0] -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $path = $cmd.Path
+        if (-not $path) { $path = $cmd.Definition }
+        if (-not $path -or (Test-StoreStub $path)) { continue }
+        $global:LASTEXITCODE = 1
+        $null | & $path @extra -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' *> $null
+        if ($LASTEXITCODE -eq 0) { $py = $path; $pre = $extra; break }
+    }
+    if ($py) { break }
 }
 
 if (-not $py) {
