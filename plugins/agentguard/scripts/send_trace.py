@@ -75,8 +75,15 @@ ERROR_LOG_MAX_BYTES = 1024 * 1024
 DEFAULT_MAX_CONTENT_CHARS = 2000
 LOCK_WAIT_SECONDS = 20.0
 AGENT_TOOL_NAMES = ("Agent", "Task")
+# The only hook input fields the worker reads. The rest (Stop's last_assistant_message can be
+# megabytes) must not be passed on: the payload travels in an environment variable, and
+# environment size is limited (128 KB per variable on Linux, about 1 MB in total on macOS).
+WORKER_PAYLOAD_KEYS = ("session_id", "transcript_path", "hook_event_name", "cwd")
 OTEL_VAR_PATTERN = re.compile(r"^(CLAUDE_CODE_ENABLE_TELEMETRY|OTEL_[A-Z0-9_]+)$")  # Claude Code's own telemetry
-SECRET_PATTERN = re.compile(r"sk-lf-[A-Za-z0-9_-]{8,}")
+# AgentGuard API keys: "sk-ag-<uuid>" / "pk-ag-<uuid>" (packages/shared/src/server/auth/apiKeys.ts).
+# "sk-lf-" / "pk-lf-" are the Langfuse-style keys AgentGuard also accepts. Both secret and
+# public keys are redacted from anything the plugin logs or sends.
+KEY_PATTERN = re.compile(r"\b(?:sk|pk)-(?:ag|lf)-[A-Za-z0-9_-]{8,}")
 TRUE_VALUES = ("1", "true", "yes", "on")
 
 # User entries that are not new turns (prefixes of their text).
@@ -147,7 +154,7 @@ def redact(text, cfg=None):
         return text
     if cfg is not None and cfg.secret_key and cfg.secret_key in text:
         text = text.replace(cfg.secret_key, "[REDACTED]")
-    return SECRET_PATTERN.sub("[REDACTED]", text)
+    return KEY_PATTERN.sub("[REDACTED]", text)
 
 
 def ensure_dir(path):
@@ -1098,10 +1105,14 @@ def hook_main():
         return
     if not isinstance(payload, dict):
         return
+    payload = {k: payload[k] for k in WORKER_PAYLOAD_KEYS if k in payload}
     if cfg.debug or env_true("AGENTGUARD_SYNC"):
         run_worker(payload, cfg)
-    else:
+        return
+    try:
         spawn_worker(json.dumps(payload))
+    except OSError as exc:
+        log_error("could not start the background worker: %s: %s" % (type(exc).__name__, exc))
 
 
 def worker_main():
@@ -1259,8 +1270,8 @@ def setup_main(args):
         if not host:
             host = input("AgentGuard host [%s]: " % DEFAULT_HOST).strip() or DEFAULT_HOST
         if not public_key:
-            public_key = input("Public key (pk-lf-...): ").strip()
-        secret = getpass.getpass("Secret key (sk-lf-..., hidden): ").strip()
+            public_key = input("Public key (pk-ag-...): ").strip()
+        secret = getpass.getpass("Secret key (sk-ag-..., hidden): ").strip()
     else:
         secret = sys.stdin.readline().strip() if args.secret_stdin else (os.environ.get("AGENTGUARD_SECRET_KEY") or "").strip()
     host = (host or DEFAULT_HOST).strip().rstrip("/")

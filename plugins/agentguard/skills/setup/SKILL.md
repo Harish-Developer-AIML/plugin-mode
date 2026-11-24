@@ -7,8 +7,8 @@ allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py" --stat
 # AgentGuard setup
 
 You are setting up the AgentGuard plugin. It sends each Claude Code session to AgentGuard as
-traces. It needs three values: the AgentGuard host, a public key (`pk-lf-...`) and a secret
-key (`sk-lf-...`). Both keys come from the AgentGuard project's settings page (API keys).
+traces. It needs three values: the AgentGuard host, a public key (`pk-ag-...`) and a secret
+key (`sk-ag-...`). Both keys come from the AgentGuard project's settings page (API keys).
 
 Current plugin status:
 

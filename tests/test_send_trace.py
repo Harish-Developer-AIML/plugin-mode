@@ -4,6 +4,7 @@
 """
 
 import base64
+import gc
 import importlib.util
 import io
 import json
@@ -15,7 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -26,6 +27,29 @@ SESSION = "11111111-2222-3333-4444-555555555555"
 
 sys.path.insert(0, HERE)
 from fake_server import FakeAgentGuard  # noqa: E402
+
+# A ResourceWarning raised while an object is garbage collected never fails a test on its own,
+# even with -W error: Python reports it through sys.unraisablehook and carries on. Collect those
+# here and fail the run in tearDownModule, so "-W error::ResourceWarning" really means no leaks.
+_UNRAISABLE = []
+_previous_hook = sys.unraisablehook
+
+
+def _record_unraisable(info):
+    if isinstance(info.exc_value, ResourceWarning):
+        _UNRAISABLE.append("%s: %r" % (info.exc_value, info.object))
+    _previous_hook(info)
+
+
+def setUpModule():
+    sys.unraisablehook = _record_unraisable
+
+
+def tearDownModule():
+    gc.collect()
+    sys.unraisablehook = _previous_hook
+    if _UNRAISABLE:
+        raise AssertionError("unclosed resources: " + "; ".join(_UNRAISABLE))
 
 
 def load_module():
@@ -82,8 +106,16 @@ class Base(unittest.TestCase):
                 env.pop(k, None)
         return env
 
-    def payload(self, event="Stop", transcript=None):
-        return json.dumps({"session_id": SESSION, "transcript_path": transcript or self.transcript, "cwd": self.project, "hook_event_name": event, "stop_hook_active": False})
+    def payload(self, event="Stop", transcript=None, **extra):
+        data = {"session_id": SESSION, "transcript_path": transcript or self.transcript, "cwd": self.project, "hook_event_name": event, "stop_hook_active": False}
+        data.update(extra)
+        return json.dumps(data)
+
+    def wait_for_offset(self, key, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline and self.offset(key) == 0:
+            time.sleep(0.2)
+        return self.offset(key)
 
     def run_hook(self, event="Stop", stdin=None, timeout=30, **env):
         start = time.monotonic()
@@ -418,13 +450,18 @@ class IncrementalTests(Base):
         self.assertEqual(self.offset(), sum(len(l) for l in lines[:5]))
 
     def test_concurrent_runs_do_not_double_send(self):
-        procs = [subprocess.Popen([sys.executable, SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env()) for _ in range(4)]
+        # Hook input comes from a file, not a pipe, so all four start at once and
+        # communicate() has no stdin to write (on 3.12 it fails on a closed stdin pipe).
+        stdin_path = os.path.join(self.tmp, "hook-input.json")
+        with open(stdin_path, "w") as fh:
+            fh.write(self.payload())
+        procs = []
+        for _ in range(4):
+            with open(stdin_path, "rb") as stdin:
+                procs.append(subprocess.Popen([sys.executable, SCRIPT], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env()))
         for p in procs:
-            p.stdin.write(self.payload().encode())
-            p.stdin.close()
-        for p in procs:
-            p.wait(timeout=60)
-            self.assertEqual(p.returncode, 0)
+            out, err = p.communicate(timeout=60)  # also closes the stdout/stderr pipes
+            self.assertEqual((p.returncode, out, err), (0, b"", b""))
         ids = [(e["type"], e["body"]["id"]) for e in self.server.events()]
         self.assertEqual(len(ids), len(set(ids)))
         self.assertEqual(len(self.by_type("generation-create")), 7)
@@ -472,6 +509,17 @@ class ContentTests(Base):
         self.run_hook(AGENTGUARD_LOG_CONTENT="true", AGENTGUARD_MAX_CONTENT_CHARS="200")
         g = self.by_type("generation-create")[self.mod.det_id(SESSION, "gen", "msg_LONG")]
         self.assertEqual(g["output"], "A" * 200 + "... [truncated 401 chars]")  # 300 + newline + 300 = 601
+
+    def test_agentguard_format_keys_redacted_in_content(self):
+        sk, pk = RedactionTests.AG_SECRET, RedactionTests.AG_PUBLIC
+        with open(self.transcript, "a") as fh:
+            fh.write(json.dumps({"type": "user", "uuid": "u-ag", "parentUuid": None, "timestamp": "2026-11-20T11:00:00.000Z", "sessionId": SESSION, "turnOrigin": "human", "message": {"role": "user", "content": "keys: %s and %s" % (sk, pk)}}) + "\n")
+        self.run_hook(AGENTGUARD_LOG_CONTENT="true")
+        t = self.by_type("trace-create")[self.mod.det_id(SESSION, "trace", "u-ag")]
+        self.assertEqual(t["input"], "keys: [REDACTED] and [REDACTED]")
+        raw = b"".join(r["raw"] for r in self.server.requests)
+        self.assertNotIn(sk.encode(), raw)
+        self.assertNotIn(pk.encode(), raw)
 
     def test_configured_secret_redacted_even_in_content(self):
         with open(self.transcript, "a") as fh:
@@ -628,6 +676,116 @@ class DetachTests(Base):
             time.sleep(0.2)
         self.assertGreater(self.offset(), 0)
         self.assertEqual(len(self.by_type("generation-create")), 7)
+
+    def _large_input_is_sent(self, size):
+        stdin = self.payload(last_assistant_message="x" * size)
+        proc, elapsed = self.run_hook(stdin=stdin, AGENTGUARD_SYNC=None)
+        self.assertQuietSuccess(proc)
+        self.assertLess(elapsed, 1.5)
+        self.assertGreater(self.wait_for_offset("agent-afixture01"), 0, self.error_log())
+        self.assertEqual(len(self.by_type("generation-create")), 7)
+        self.assertNotIn("worker", self.error_log())
+
+    def test_500kb_last_assistant_message(self):
+        # over Linux's 128 KB limit for one environment variable
+        self._large_input_is_sent(500 * 1024)
+
+    def test_2mb_last_assistant_message(self):
+        # over macOS's ~1 MB limit for the whole environment
+        self._large_input_is_sent(2 * 1024 * 1024)
+
+
+class HookPayloadTests(unittest.TestCase):
+    """In-process checks of what hook mode hands to the worker."""
+
+    HOOK_INPUT = {
+        "session_id": SESSION,
+        "transcript_path": "/tmp/x/%s.jsonl" % SESSION,
+        "cwd": "/tmp/x",
+        "hook_event_name": "Stop",
+        "prompt_id": "p-1",
+        "permission_mode": "default",
+        "stop_hook_active": False,
+        "last_assistant_message": "y" * (500 * 1024),
+        "background_tasks": [],
+    }
+
+    def setUp(self):
+        self.mod = load_module()
+        self.tmp = tempfile.mkdtemp(prefix="agentguard-hook-")
+        self.env = mock.patch.dict(os.environ, {"AGENTGUARD_PUBLIC_KEY": "pk-lf-test", "AGENTGUARD_SECRET_KEY": "sk-lf-test-secret-0000", "AGENTGUARD_HOME": self.tmp})
+        self.env.start()
+        for name in ("AGENTGUARD_SYNC", "AGENTGUARD_DEBUG"):
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_main(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(self.HOOK_INPUT))), mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stderr", err):
+            code = self.mod.main([])
+        self.assertEqual((code, out.getvalue(), err.getvalue()), (0, "", ""))
+
+    def test_worker_env_has_only_the_four_fields(self):
+        with mock.patch.object(self.mod.subprocess, "Popen") as popen:
+            self.run_main()
+        self.assertEqual(popen.call_count, 1)
+        env = popen.call_args[1]["env"]
+        payload = json.loads(env["AGENTGUARD_HOOK_PAYLOAD"])
+        self.assertEqual(payload, {"session_id": SESSION, "transcript_path": "/tmp/x/%s.jsonl" % SESSION, "cwd": "/tmp/x", "hook_event_name": "Stop"})
+        self.assertLess(sum(len(k) + len(v) for k, v in env.items()), 100 * 1024)
+
+    def test_sync_mode_gets_the_same_four_fields(self):
+        os.environ["AGENTGUARD_SYNC"] = "1"
+        with mock.patch.object(self.mod, "run_worker") as run_worker:
+            self.run_main()
+        self.assertEqual(sorted(run_worker.call_args[0][0]), ["cwd", "hook_event_name", "session_id", "transcript_path"])
+
+    def test_missing_fields_are_left_out(self):
+        self.HOOK_INPUT = {"session_id": SESSION, "last_assistant_message": "z"}
+        with mock.patch.object(self.mod.subprocess, "Popen") as popen:
+            self.run_main()
+        self.assertEqual(json.loads(popen.call_args[1]["env"]["AGENTGUARD_HOOK_PAYLOAD"]), {"session_id": SESSION})
+
+    def test_spawn_oserror_is_logged_and_exits_0(self):
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=OSError(7, "Argument list too long")):
+            self.run_main()
+        with open(os.path.join(self.tmp, "error.log")) as fh:
+            log = fh.read()
+        self.assertIn("could not start the background worker: OSError", log)
+
+
+class RedactionTests(unittest.TestCase):
+    AG_SECRET = "sk-ag-3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f"
+    AG_PUBLIC = "pk-ag-0e1d2c3b-4a59-4687-b7c6-d5e4f3a2b1c0"
+    LF_SECRET = "sk-lf-0123456789abcdef"
+    LF_PUBLIC = "pk-lf-fedcba9876543210"
+
+    def setUp(self):
+        self.mod = load_module()
+
+    def test_each_format_is_redacted(self):
+        for key in (self.AG_SECRET, self.AG_PUBLIC, self.LF_SECRET, self.LF_PUBLIC):
+            self.assertEqual(self.mod.redact("auth with %s failed" % key), "auth with [REDACTED] failed", key)
+
+    def test_other_text_is_left_alone(self):
+        for text in ("pk-ag-", "sk-ag-short", "task-ag-12345678abcdef", "disk-lf-12345678abcdef", "sk-xx-12345678abcdef"):
+            self.assertEqual(self.mod.redact(text), text)
+
+    def test_error_log_never_holds_keys(self):
+        tmp = tempfile.mkdtemp(prefix="agentguard-redact-")
+        try:
+            with mock.patch.dict(os.environ, {"AGENTGUARD_HOME": tmp}):
+                self.mod.log_error("keys %s %s %s %s" % (self.AG_SECRET, self.AG_PUBLIC, self.LF_SECRET, self.LF_PUBLIC))
+            with open(os.path.join(tmp, "error.log")) as fh:
+                log = fh.read()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(log.count("[REDACTED]"), 4)
+        for key in (self.AG_SECRET, self.AG_PUBLIC, self.LF_SECRET, self.LF_PUBLIC):
+            self.assertNotIn(key, log)
 
 
 class SubagentOrderTests(Base):

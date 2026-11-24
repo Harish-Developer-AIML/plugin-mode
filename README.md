@@ -9,12 +9,18 @@ Prompt and response text is sent only if you turn it on.
 In Claude Code:
 
 ```
-/plugin marketplace add actaclad/agentguard-claude-code
+/plugin marketplace add Harish-Developer-AIML/plugin-mode
 /plugin install agentguard@actaclad
 /agentguard:setup
 ```
 
 Then **restart Claude Code**. From then on, every session is sent automatically.
+
+The `@actaclad` in the install command is the marketplace's name from
+`.claude-plugin/marketplace.json`, not the GitHub owner, so it stays `actaclad` wherever the
+repository lives.
+
+**Supported: macOS and Linux. Windows is not supported yet.**
 
 You need Python 3.8 or newer as `python3` on your `PATH`; macOS and most Linux systems have it.
 The plugin uses only the standard library, so there is nothing to `pip install`.
@@ -26,8 +32,8 @@ The plugin uses only the standard library, so there is nothing to `pip install`.
 | Value | Where to find it |
 |---|---|
 | Host | `https://ag-dev.actaclad.com` unless you were given another one |
-| Public key (`pk-lf-...`) | AgentGuard → your project → Settings → API keys |
-| Secret key (`sk-lf-...`) | Shown once when the key is created |
+| Public key (`pk-ag-...`) | AgentGuard → your project → Settings → API keys |
+| Secret key (`sk-ag-...`) | Shown once when the key is created |
 
 You can enter them in two ways:
 
@@ -68,8 +74,8 @@ OS username.
 
 **Not sent by default:** your prompts, Claude's responses, tool inputs (commands, file paths,
 edits) and tool outputs. Only names, counts, sizes and timing are sent. Claude's thinking is
-never sent. Anything that looks like an AgentGuard secret key (`sk-lf-...`) is replaced with
-`[REDACTED]` before sending.
+never sent. Anything that looks like an AgentGuard API key (`sk-ag-...`, `pk-ag-...`, or the
+older `sk-lf-...` / `pk-lf-...`) is replaced with `[REDACTED]` before sending and in the error log.
 
 ### Send prompt and response text too
 
@@ -161,10 +167,21 @@ python3 tests/fake_server.py 18765             # a local fake AgentGuard that pr
 claude plugin validate .                       # check the marketplace and plugin manifests
 ```
 
-To try a local checkout: `/plugin marketplace add ./agentguard-claude-code`, then
-`/plugin install agentguard@actaclad`. Alternatively, start Claude Code with
-`claude --plugin-dir ./agentguard-claude-code/plugins/agentguard` to load it for one session
-without installing.
+To try a local checkout:
+
+```
+git clone https://github.com/Harish-Developer-AIML/plugin-mode.git
+```
+
+Then, in Claude Code started from the folder that contains `plugin-mode`:
+
+```
+/plugin marketplace add ./plugin-mode
+/plugin install agentguard@actaclad
+```
+
+Alternatively, `claude --plugin-dir ./plugin-mode/plugins/agentguard` loads the plugin for one
+session without installing it.
 
 `NOTES.md` records how the transcript format, hook inputs and ingestion API were checked. To
 change which usage keys are sent (they must match AgentGuard's model price table), edit

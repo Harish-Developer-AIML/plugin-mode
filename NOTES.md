@@ -171,8 +171,8 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
 - Setup offers two ways to give the keys: the default is a command the user runs in their own
   terminal, which asks for the secret with a hidden prompt, so the secret never enters the
   chat. Pasting the keys into chat also works, but the secret is then in the session
-  transcript. The worker always redacts the configured secret key (and anything shaped like
-  `sk-lf-...`) from any content it sends.
+  transcript. The worker always redacts the configured secret key, and anything shaped like an
+  AgentGuard key (see section 7), from any content it sends.
 
 ## 6. Known limits
 
@@ -183,3 +183,35 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
 - A subagent whose `Agent` call has not been seen yet is held back (its offset does not move)
   until it has, except on SessionEnd. There, the subagent gets its own trace instead of being
   dropped.
+
+## 7. Changes in this round (still 0.1.0, not released)
+
+- **Large hook input broke the background worker (bug).** The hook handed its whole stdin JSON
+  to the worker in the `AGENTGUARD_HOOK_PAYLOAD` environment variable. Stop's
+  `last_assistant_message` can be very large, and environment size is limited (128 KB per
+  variable on Linux, about 1 MB in total on macOS, about 32 KB on Windows). `Popen` then failed
+  with "Argument list too long" and that Stop sent nothing. This was reproduced here with a
+  2 MB message. Now only the four fields the worker reads (`session_id`, `transcript_path`,
+  `hook_event_name`, `cwd`) are passed, in both background and sync/debug mode. An `OSError`
+  from starting the worker is written to `error.log`, and the hook still exits 0. Tests:
+  500 KB and 2 MB messages through the real spawn path, the exact payload in the worker's
+  environment, sync mode, and the `OSError` path.
+- **Repository path.** README and `plugin.json` now point to
+  `https://github.com/Harish-Developer-AIML/plugin-mode`. The marketplace name stays
+  `actaclad`, so the install command is unchanged: in `agentguard@actaclad`, the part after
+  `@` is the marketplace name, not the GitHub owner. The local-checkout example uses the
+  clone's folder name, `plugin-mode`.
+- **Key redaction.** AgentGuard generates keys as `pk-ag-<uuid>` and `sk-ag-<uuid>`
+  (`generateKeySet` in `packages/shared/src/server/auth/apiKeys.ts`). `sk-lf-` and `pk-lf-`
+  appear only in its tests. The pattern is now `\b(?:sk|pk)-(?:ag|lf)-[A-Za-z0-9_-]{8,}`, so it
+  covers secret and public keys in both formats and is applied to `error.log`, debug output and
+  any content sent. It now requires a word boundary before the key, so text such as
+  `disk-lf-...` is no longer cut. The configured secret is still also redacted by exact match.
+  Setup prompts and docs now show the `-ag-` format.
+- **Windows.** The README says "Supported: macOS and Linux. Windows is not supported yet."
+  (the hooks call `python3`). The Windows code paths are left in place but untested.
+- **Test leaks.** The concurrent-runs test never closed its subprocess pipes (8
+  `ResourceWarning`s). It now reads the hook input from a file and collects output with
+  `communicate()`, which closes every pipe and also works on Python 3.12. A warning raised during garbage collection
+  never fails a test, even with `-W error`, so the test module now collects them with
+  `sys.unraisablehook` and fails the run if there are any.
