@@ -1,0 +1,29 @@
+{
+  "description": "Send Claude Code session data to AgentGuard. The hook hands the work to a detached background process and returns at once.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

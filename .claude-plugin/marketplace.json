@@ -1,0 +1,19 @@
+{
+  "name": "actaclad",
+  "owner": {
+    "name": "Actaclad"
+  },
+  "metadata": {
+    "description": "Actaclad plugins for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "agentguard",
+      "source": "./plugins/agentguard",
+      "description": "Send every Claude Code session to AgentGuard as traces: user, session, model, tokens, cost, tool calls and timing.",
+      "version": "0.1.0",
+      "category": "monitoring",
+      "tags": ["observability", "tracing", "agentguard", "langfuse"]
+    }
+  ]
+}

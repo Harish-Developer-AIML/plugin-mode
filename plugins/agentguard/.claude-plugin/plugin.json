@@ -1,0 +1,11 @@
+{
+  "name": "agentguard",
+  "version": "0.1.0",
+  "description": "Send every Claude Code session to AgentGuard as traces: user, session, model, tokens, cost, tool calls and timing.",
+  "author": {
+    "name": "Actaclad"
+  },
+  "homepage": "https://github.com/actaclad/agentguard-claude-code",
+  "repository": "https://github.com/actaclad/agentguard-claude-code",
+  "keywords": ["observability", "tracing", "agentguard", "langfuse"]
+}
