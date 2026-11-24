@@ -1,18 +1,24 @@
 ---
 description: Show the AgentGuard plugin's status. Shows whether the keys are set (masked), when data was last sent and with what result, and the latest errors.
 disable-model-invocation: true
-allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py" --status)
+allowed-tools: Bash(sh "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh" --status) PowerShell(powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.ps1" --status)
 ---
 
 # AgentGuard status
 
-```
-!`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py" --status`
-```
+Run the status command once, with the shell tool you have:
 
-Show the status above to the user unchanged, in a code block. Then add a short diagnosis,
-only for the problems that actually appear:
+- **Bash tool** (macOS, Linux, WSL, or Windows with Git Bash):
+  `sh "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh" --status`
+- **PowerShell tool** (Windows without Git Bash):
+  `powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.ps1" --status`
 
+Show its output to the user unchanged, in a code block. Then add a short diagnosis, only for
+the problems that actually appear:
+
+- **"AgentGuard needs Python 3.8 or newer"**: the output already says how to install Python
+  for each system. Tell the user which line applies to their system (you know their
+  platform), and to restart Claude Code afterwards.
 - **Keys are not set:** run `/agentguard:setup`.
 - **Keys are in settings.json but not in this session:** restart Claude Code.
 - **Last send FAILED (HTTP 401 or 403):** the keys are wrong or belong to another host. Run

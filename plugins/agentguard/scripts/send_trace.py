@@ -85,6 +85,12 @@ OTEL_VAR_PATTERN = re.compile(r"^(CLAUDE_CODE_ENABLE_TELEMETRY|OTEL_[A-Z0-9_]+)$
 # public keys are redacted from anything the plugin logs or sends.
 KEY_PATTERN = re.compile(r"\b(?:sk|pk)-(?:ag|lf)-[A-Za-z0-9_-]{8,}")
 TRUE_VALUES = ("1", "true", "yes", "on")
+IS_WINDOWS = os.name == "nt"
+# Windows process creation flags (subprocess has names for some of them only from 3.7 on).
+DETACHED_PROCESS = 0x00000008
+CREATE_NEW_PROCESS_GROUP = 0x00000200
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+CREATE_NO_WINDOW = 0x08000000
 
 # User entries that are not new turns (prefixes of their text).
 NON_TURN_PREFIXES = (
@@ -157,6 +163,20 @@ def redact(text, cfg=None):
     return KEY_PATTERN.sub("[REDACTED]", text)
 
 
+def replace_file(src, dst, attempts=10):
+    """os.replace that copes with Windows, where it fails while another process has dst
+    open (an editor, a virus scanner, or Claude Code reading settings.json). Retries for
+    about a second, then raises the last error."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if not IS_WINDOWS or attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
+
+
 def ensure_dir(path):
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
@@ -182,7 +202,7 @@ def log_error(msg):
         path = error_log_path()
         try:
             if os.path.getsize(path) > ERROR_LOG_MAX_BYTES:
-                os.replace(path, path + ".1")
+                replace_file(path, path + ".1", attempts=3)
         except OSError:
             pass
         line = "%s %s\n" % (now_iso(), redact(msg).replace("\n", " | "))
@@ -331,7 +351,7 @@ def save_state(st):
         os.chmod(tmp, 0o600)
     except OSError:
         pass
-    os.replace(tmp, state_path())
+    replace_file(tmp, state_path())
 
 
 def cleanup_state(st, now=None):
@@ -901,7 +921,8 @@ def resolve_user(cfg, cwd):
     if cfg.user:
         return cfg.user
     try:
-        out = subprocess.run(["git", "config", "user.email"], cwd=cwd if cwd and os.path.isdir(cwd) else None, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2)
+        extra = {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}  # the worker has no console: don't open one
+        out = subprocess.run(["git", "config", "user.email"], cwd=cwd if cwd and os.path.isdir(cwd) else None, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2, **extra)
         email = out.stdout.decode("utf-8", "replace").strip()
         if email:
             return email
@@ -1083,12 +1104,19 @@ def run_worker(payload, cfg):
 def spawn_worker(raw_payload):
     env = dict(os.environ)
     env["AGENTGUARD_HOOK_PAYLOAD"] = raw_payload
+    argv = [sys.executable, os.path.abspath(__file__), "--worker"]
     kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True, "env": env}
-    if os.name == "nt":  # pragma: no cover
-        kwargs["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--worker"], **kwargs)
+    if not IS_WINDOWS:
+        subprocess.Popen(argv, start_new_session=True, **kwargs)
+        return
+    # No console, own process group, and out of Claude Code's job object if the job allows
+    # it, so the worker is not killed with the hook or with Claude Code. A job that forbids
+    # breakaway makes CreateProcess fail with "access denied": then start it inside the job.
+    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    try:
+        subprocess.Popen(argv, creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+    except OSError:
+        subprocess.Popen(argv, creationflags=flags, **kwargs)
 
 
 def hook_main():
@@ -1097,7 +1125,10 @@ def hook_main():
     _CFG = cfg
     if not cfg.has_keys:
         return  # not set up: stay silent
-    raw = sys.stdin.read()
+    # Claude Code writes UTF-8. Decode it ourselves: on Windows, text-mode stdin would use the
+    # ANSI code page and garble non-ASCII paths.
+    stream = getattr(sys.stdin, "buffer", None)
+    raw = stream.read().decode("utf-8-sig", "replace") if stream is not None else sys.stdin.read()
     try:
         payload = json.loads(raw) if raw.strip() else {}
     except ValueError:
@@ -1170,6 +1201,7 @@ def status_main():
         settings_env = {}
         print("WARNING: could not read %s: %s" % (settings_path(), exc))
     print("AgentGuard plugin %s" % PLUGIN_VERSION)
+    print("Python: %s (%s)" % (sys.executable, sys.version.split()[0]))
     print("Host: %s" % cfg.host)
     print("Public key: %s" % mask(cfg.public_key))
     print("Secret key: %s" % ("set (ends ...%s)" % cfg.secret_key[-4:] if len(cfg.secret_key) > 8 else ("set" if cfg.secret_key else "(not set)")))
@@ -1258,7 +1290,14 @@ def write_settings(updates, remove_keys):
         os.chmod(tmp, 0o600)
     except OSError:
         pass
-    os.replace(tmp, path)
+    try:
+        replace_file(tmp, path)
+    except PermissionError:
+        # Windows: something keeps settings.json open without delete sharing. Overwriting
+        # in place still works there; the backup above guards against a half-written file.
+        with open(path, "w", encoding="utf-8") as fh, open(tmp, "r", encoding="utf-8") as src:
+            fh.write(src.read())
+        os.remove(tmp)
     return backup
 
 
@@ -1345,6 +1384,11 @@ def main(argv=None):
         return 0
 
     args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")  # e.g. a non-ASCII path on a Windows code page
+        except (AttributeError, ValueError):
+            pass
     if args.status:
         return status_main()
     if args.check_otel:

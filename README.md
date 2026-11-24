@@ -20,10 +20,24 @@ The `@actaclad` in the install command is the marketplace's name from
 `.claude-plugin/marketplace.json`, not the GitHub owner, so it stays `actaclad` wherever the
 repository lives.
 
-**Supported: macOS and Linux. Windows is not supported yet.**
+## Supported platforms
 
-You need Python 3.8 or newer as `python3` on your `PATH`; macOS and most Linux systems have it.
-The plugin uses only the standard library, so there is nothing to `pip install`.
+**macOS, Linux, and Windows (native, or in WSL).** The plugin needs **Python 3.8 or newer**.
+It uses only Python's standard library, so there is nothing to `pip install`. It looks for
+`python3`, then `python`, then `py -3`, and uses the first that is 3.8 or newer.
+
+| Platform | Python | Notes |
+|---|---|---|
+| macOS | Usually there already: `python3` comes with the Xcode command line tools, which git needs too. Otherwise `brew install python3` or [python.org](https://www.python.org/downloads/macos/). | |
+| Linux | Usually there already. Otherwise `sudo apt install python3` (Debian, Ubuntu) or `sudo dnf install python3` (Fedora). | |
+| Windows, native | Not included in Windows. Install it with `winget install Python.Python.3.12` or from [python.org](https://www.python.org/downloads/windows/), and tick **"Add python.exe to PATH"** in the installer. The `py` launcher that comes with it also works. Python from the Microsoft Store works too. | Works with or without Git for Windows. With it, the hooks run in Git Bash; without it, in PowerShell. The `python` / `python3` shortcuts Windows ships, which only open the Microsoft Store, are detected and never run. |
+| Windows, WSL | Install Python inside the WSL distribution, as on Linux. | Run Claude Code inside WSL. Settings are in the Linux home folder there (`~/.claude`), not the Windows one. |
+
+Without a suitable Python the plugin does nothing. Claude Code works normally, and
+`/agentguard:status` and `/agentguard:setup` say how to install Python.
+
+On Windows, `~/.claude` below means `%USERPROFILE%\.claude`, for example
+`C:\Users\you\.claude\settings.json`.
 
 ## Set up your keys
 
@@ -105,8 +119,10 @@ All of these go in the `env` block of `~/.claude/settings.json`:
 ## How it works
 
 The plugin registers a hook on `Stop` (each time Claude finishes answering) and on
-`SessionEnd`. The hook starts a background process and returns at once, so Claude Code never
-waits for the network. The background process:
+`SessionEnd`. The hook runs a small launcher (`scripts/agentguard.sh` in sh or Git Bash,
+`scripts/agentguard.ps1` in PowerShell). The launcher finds Python and starts
+`scripts/send_trace.py`, which starts a background process and returns at once, so Claude
+Code never waits for the network. The background process:
 
 1. reads only the transcript lines added since its last run (it saves its place per session
    in `~/.claude/agentguard/state.json`);
@@ -141,11 +157,20 @@ For a closer look, set `"AGENTGUARD_DEBUG": "true"` in the settings `env` block 
 Each send then runs in the foreground and prints to Claude Code's hook output (`claude --debug`
 or verbose mode). Turn it off afterwards, because in debug mode each answer waits for the send.
 
-You can also run the script yourself:
+You can also run the status check yourself:
 
 ```
-python3 ~/.claude/plugins/cache/actaclad/agentguard/<version>/scripts/send_trace.py --status
+# macOS, Linux, WSL, Git Bash
+sh ~/.claude/plugins/cache/actaclad/agentguard/<version>/scripts/agentguard.sh --status
+
+# Windows PowerShell or Command Prompt
+powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\.claude\plugins\cache\actaclad\agentguard\<version>\scripts\agentguard.ps1" --status
 ```
+
+In PowerShell, write `$env:USERPROFILE` instead of `%USERPROFILE%`.
+
+If status says **"AgentGuard needs Python 3.8 or newer"**, install Python as shown under
+[Supported platforms](#supported-platforms) and restart Claude Code.
 
 ## Uninstall
 
@@ -160,8 +185,14 @@ log).
 
 ## Development
 
+CI (`.github/workflows/tests.yml`) runs every test on ubuntu-latest, macos-latest and
+windows-latest with Python 3.8 and 3.12. That includes the hook command itself under sh, dash,
+bash, Git Bash, PowerShell 7 and Windows PowerShell 5.1, wherever the runner has them.
+
+
 ```
 python3 -m unittest discover -s tests -v       # all tests, standard library only
+                                               # (PowerShell tests run where pwsh/powershell exist)
 python3 tests/fixtures/build_fixtures.py       # rebuild the anonymized transcript fixtures
 python3 tests/fake_server.py 18765             # a local fake AgentGuard that prints what it receives
 claude plugin validate .                       # check the marketplace and plugin manifests

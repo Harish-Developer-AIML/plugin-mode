@@ -24,8 +24,8 @@ Sources: `plugins/create-marketplace.md`, `plugins/marketplace-reference.md`,
   and SessionEnd take no matcher. `timeout` is in seconds (default 600). `${CLAUDE_PLUGIN_ROOT}`
   is expanded in `command` and `args`. The exec form (`"command": "python3", "args": [...]`)
   is preferred, because an unquoted variable in the shell form makes `claude plugin validate`
-  warn. The plugin uses the exec form, which runs the same command as the spec's
-  `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py`.
+  warn. ~~The plugin uses the exec form~~ Superseded in section 8: exec form cannot be portable
+  to Windows, so the hooks now use one shell-form command that runs in sh and in PowerShell.
 - **Hook stdin.** Common fields: `session_id`, `prompt_id`, `transcript_path`, `cwd`,
   `permission_mode`, `effort`, `hook_event_name`. Stop adds `stop_hook_active`,
   `last_assistant_message`, `background_tasks`. SessionEnd adds `reason` (`clear`,
@@ -215,3 +215,111 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
   `communicate()`, which closes every pipe and also works on Python 3.12. A warning raised during garbage collection
   never fails a test, even with `-W error`, so the test module now collects them with
   `sys.unraisablehook` and fails the run if there are any.
+
+## 8. Native Windows (checked 2026-11-24 against code.claude.com/docs/en/{hooks,skills,setup,permissions,tools-reference,plugins/components}.md)
+
+### What the docs say
+
+- **Git Bash is optional on native Windows.** (setup.md) "Installing Git for Windows is optional
+  ... Without Git for Windows, Claude Code runs shell commands via the PowerShell tool." WSL
+  setups behave like Linux.
+- **Shell-form hooks** (no `args`): "The `command` string is passed to a shell: `sh -c` on
+  macOS and Linux, Git Bash on Windows, or PowerShell when Git Bash isn't installed." The
+  per-hook `shell` field ("bash" or "powershell") is not tied to the OS, so it can't choose
+  per platform. For PowerShell, "Claude Code auto-detects `pwsh.exe` ... and falls back to
+  `powershell.exe` for Windows PowerShell 5.1."
+- **Exec-form hooks** (`args` set): `command` "is resolved as an executable on PATH and spawned
+  directly", and "on Windows, exec form requires `command` to resolve to a real executable such
+  as a `.exe`". No executable exists on all three systems (`python3` is not on Windows,
+  `powershell` is not on macOS/Linux). A hook that cannot start is a non-blocking error, which
+  shows a "hook error" notice. **So exec form cannot be portable, and the previous
+  `python3` exec-form hook either failed on Windows or ran the Microsoft Store stub.**
+- **`${CLAUDE_PLUGIN_ROOT}`** is substituted into `command` (and `args`) before any shell sees
+  it, and "every hook process receives `CLAUDE_PLUGIN_ROOT` ... in its environment"
+  (plugins/components.md).
+- **Skill `!` commands** run through the Bash tool when bash is available (Git Bash on Windows),
+  otherwise through the PowerShell tool (skills.md, "How injected commands run"). "A failed
+  command aborts the entire skill invocation." Injected commands "never prompt": outside auto
+  mode, one that `allowed-tools` doesn't allow aborts the skill. `PowerShell(...)` permission
+  rules have the same shape as `Bash(...)` rules (permissions.md).
+- **Not documented:** the exact flags Claude Code passes to PowerShell for a hook (`-Command`
+  text versus a temporary file). The design below assumes the command text is parsed as
+  PowerShell source, which is what `-Command`, `-EncodedCommand` and the docs' "PowerShell
+  started no program" troubleshooting all imply. The Windows test on a real machine confirms it.
+
+### Design
+
+- **Hook command:** one shell-form command, the same for Stop and SessionEnd, valid in both
+  sh and PowerShell:
+
+  ```
+  echo `# <#` >/dev/null
+  sh "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh"; exit 0
+  #> > $null; try { & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts') 'agentguard.ps1')))) } catch { }; exit 0
+  ```
+
+  In sh, the backticks hold only a comment, so line 1 is an empty `echo`; line 2 runs the sh
+  launcher; line 3 is a comment. In PowerShell, `` `# `` is an escaped `#`, `<#` opens a block
+  comment that hides line 2, `#>` closes it, `> $null` silences the `echo`, and the rest loads
+  the PowerShell launcher. Loading the file as a script block means PowerShell's execution
+  policy does not apply. A failure (for example Constrained Language Mode) is caught, and
+  the hook exits 0. Tested under sh, dash, bash and zsh locally; in CI also under Git Bash,
+  pwsh and Windows PowerShell 5.1, including with no Python on PATH.
+- **Launchers:** `scripts/agentguard.sh` (POSIX sh: macOS, Linux, WSL, Git Bash) and
+  `scripts/agentguard.ps1` (PowerShell 5.1 and 7). They follow the same rules, so with two
+  possible shells on Windows there is one launcher per shell, not one per OS.
+  - They try `python3`, `python`, then `py -3`, and take the first that passes
+    `sys.version_info >= (3, 8)`. The version check runs with stdin closed, so it never
+    consumes the hook input.
+  - **Microsoft Store stubs:** a candidate resolved under `...\WindowsApps\` is used only if a
+    `PythonSoftwareFoundation.*` folder sits next to it, which is how Store-installed Python
+    appears. Otherwise it is skipped **without being run**, because running the stub opens
+    the Store.
+  - **Hook mode** (no arguments): stdin is passed through to Python. The PowerShell launcher
+    reads it as bytes and pipes it as UTF-8, because 5.1 would otherwise re-encode it as
+    ASCII. Nothing is printed, and the exit code is 0 even when no Python is found.
+  - **With arguments** (status, setup): when no Python is found they print how to install it
+    for each system. `--status` then exits 0 and everything else exits 1.
+  - The sh launcher uses only shell builtins (`command -v`, `case`, `printf`), so it works
+    with a bare PATH.
+- **Skills:** the `!` injections are gone, because a `sh` command fails in the PowerShell
+  tool and that aborts the skill. Instead, the skill tells Claude to run the matching
+  launcher with the shell tool it has. Both forms are pre-approved in `allowed-tools`:
+  `Bash(sh ".../agentguard.sh" --status)` and
+  `PowerShell(powershell -NoProfile -ExecutionPolicy Bypass -File ".../agentguard.ps1" --status)`.
+  Checked on macOS: `/agentguard:status` in `claude -p` ran the launcher through the Bash rule
+  with no prompt.
+- **Line endings:** `.gitattributes` forces LF. Git on Windows usually checks out CRLF, and a
+  CRLF `agentguard.sh` fails in Git Bash. This also covers each user's plugin clone.
+
+### Windows code paths in send_trace.py (reviewed and fixed)
+
+- **Worker spawn:** `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, plus
+  `CREATE_BREAKAWAY_FROM_JOB` so the worker isn't killed with a job object Claude Code may run
+  hooks in. A job that forbids breakaway makes `CreateProcess` fail, and then the spawn is
+  retried without it. The std handles are DEVNULL and `close_fds=True`, so Claude Code never
+  waits on inherited pipes.
+- **`git config user.email`** in the console-less worker would open a console window: it now
+  uses `CREATE_NO_WINDOW` and stdin DEVNULL.
+- **Hook stdin** was read in text mode, which on Windows decodes with the ANSI code page and
+  garbles non-ASCII paths. It is now read as bytes and decoded as UTF-8, accepting a BOM.
+- **`os.replace`** fails on Windows while another process has the target open without
+  delete sharing (an editor, a virus scanner, a concurrent status read). `replace_file()`
+  retries for about a second. For `settings.json` there is also a last resort: overwrite in
+  place, with the backup already written.
+- **Status and setup output** reconfigure stdout/stderr with `errors="replace"`, so a
+  character the console code page can't encode doesn't crash them.
+- **Checked, no change needed:**
+  - `msvcrt.locking` locks byte 0 after `seek(0)`; locking past the end of an empty file is
+    allowed, and a held lock raises `OSError` at once with `LK_NBLCK`.
+  - `os.chmod(0o600/0o700)` only toggles the read-only flag on Windows and keeps files
+    writable.
+  - `~` resolves to `%USERPROFILE%` (Python 3.8+ ignores `HOME` on Windows), which is where
+    Claude Code keeps `.claude`.
+  - Transcript lines ending in CRLF are handled by `strip()`.
+
+### Still to verify on a real Windows machine
+
+- That Claude Code runs the hook command text the way the CI emulation does
+  (`-NoProfile -NonInteractive -Command`), with and without Git Bash.
+- A real session: install, setup (terminal and paste), status, and data in AgentGuard.

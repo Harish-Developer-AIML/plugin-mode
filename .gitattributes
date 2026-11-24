@@ -1,0 +1,4 @@
+# Keep LF line endings on every platform. On Windows, git often checks files out with CRLF
+# (core.autocrlf), and agentguard.sh with CRLF fails in Git Bash ("\r: command not found").
+# The transcript fixtures and the JSON manifests are compared byte for byte in tests.
+* text=auto eol=lf

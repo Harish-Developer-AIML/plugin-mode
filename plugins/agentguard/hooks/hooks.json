@@ -1,13 +1,12 @@
 {
-  "description": "Send Claude Code session data to AgentGuard. The hook hands the work to a detached background process and returns at once.",
+  "description": "Send Claude Code session data to AgentGuard. The hook hands the work to a detached background process and returns at once. The command is valid in both sh (macOS, Linux, WSL, Git Bash) and PowerShell (Windows without Git Bash): see NOTES.md.",
   "hooks": {
     "Stop": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py"],
+            "command": "echo `# <#` >/dev/null\nsh \"${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh\"; exit 0\n#> > $null; try { & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts') 'agentguard.ps1')))) } catch { }; exit 0",
             "timeout": 10
           }
         ]
@@ -18,8 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3",
-            "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py"],
+            "command": "echo `# <#` >/dev/null\nsh \"${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh\"; exit 0\n#> > $null; try { & ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts') 'agentguard.ps1')))) } catch { }; exit 0",
             "timeout": 10
           }
         ]

@@ -854,17 +854,102 @@ class PluginFilesTests(unittest.TestCase):
         with open(os.path.join(PLUGIN, "hooks", "hooks.json")) as fh:
             hooks = json.load(fh)["hooks"]
         self.assertEqual(sorted(hooks), ["SessionEnd", "Stop"])
-        for event in ("Stop", "SessionEnd"):
-            h = hooks[event][0]["hooks"][0]
-            self.assertEqual(h["type"], "command")
-            self.assertEqual(h["command"], "python3")
-            self.assertEqual(h["args"], ["${CLAUDE_PLUGIN_ROOT}/scripts/send_trace.py"])
+        self.assertEqual(hooks["Stop"], hooks["SessionEnd"])
+        h = hooks["Stop"][0]["hooks"][0]
+        self.assertEqual(h["type"], "command")
+        self.assertNotIn("args", h)  # shell form: the same text must run in sh and in PowerShell
+        self.assertNotIn("shell", h)  # default shell: sh / Git Bash, or PowerShell without Git Bash
+        lines = h["command"].split("\n")
+        self.assertEqual(lines[0], "echo `# <#` >/dev/null")  # sh: no-op; PowerShell: opens a block comment
+        self.assertEqual(lines[1], 'sh "${CLAUDE_PLUGIN_ROOT}/scripts/agentguard.sh"; exit 0')
+        self.assertTrue(lines[2].startswith("#> > $null; "))  # sh: comment; PowerShell: closes it
+        self.assertIn("agentguard.ps1", lines[2])
+        self.assertTrue(lines[2].endswith("exit 0"))
+        for name in ("agentguard.sh", "agentguard.ps1", "send_trace.py"):
+            self.assertTrue(os.path.isfile(os.path.join(PLUGIN, "scripts", name)), name)
+
+    def test_launchers_have_lf_line_endings(self):
+        for name in ("agentguard.sh", "agentguard.ps1"):
+            with open(os.path.join(PLUGIN, "scripts", name), "rb") as fh:
+                self.assertNotIn(b"\r\n", fh.read(), name)
+        with open(os.path.join(ROOT, ".gitattributes")) as fh:
+            self.assertIn("eol=lf", fh.read())
 
     def test_python38_syntax(self):
         import ast
         for path in (SCRIPT,):
             with open(path) as fh:
                 ast.parse(fh.read(), feature_version=(3, 8))
+
+
+class WindowsCodePathTests(unittest.TestCase):
+    """The Windows-only branches, exercised with mocks on every platform."""
+
+    def setUp(self):
+        self.mod = load_module()
+        self.mod.IS_WINDOWS = True
+        self.tmp = tempfile.mkdtemp(prefix="agentguard-win-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_worker_breaks_away_from_job_then_falls_back(self):
+        with mock.patch.object(self.mod.subprocess, "Popen", side_effect=[OSError(5, "Access is denied"), mock.Mock()]) as popen:
+            self.mod.spawn_worker("{}")
+        first, second = popen.call_args_list
+        self.assertEqual(first[1]["creationflags"], 0x00000008 | 0x00000200 | 0x01000000)
+        self.assertEqual(second[1]["creationflags"], 0x00000008 | 0x00000200)
+        for call in (first, second):
+            self.assertNotIn("start_new_session", call[1])
+            self.assertEqual(call[1]["stdin"], subprocess.DEVNULL)
+            self.assertTrue(call[1]["close_fds"])
+
+    def test_git_runs_without_a_console_window(self):
+        with mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(stdout=b"a@b.c\n")) as run:
+            self.assertEqual(self.mod.resolve_user(self.mod.Config({}), None), "a@b.c")
+        self.assertEqual(run.call_args[1]["creationflags"], 0x08000000)
+
+    def test_replace_retries_while_file_is_open(self):
+        with mock.patch.object(self.mod.os, "replace", side_effect=[PermissionError(13, "in use"), PermissionError(13, "in use"), None]) as rep, mock.patch.object(self.mod.time, "sleep"):
+            self.mod.replace_file("a", "b")
+        self.assertEqual(rep.call_count, 3)
+
+    def test_replace_gives_up_after_attempts(self):
+        with mock.patch.object(self.mod.os, "replace", side_effect=PermissionError(13, "in use")), mock.patch.object(self.mod.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                self.mod.replace_file("a", "b", attempts=3)
+
+    def test_not_windows_does_not_retry(self):
+        self.mod.IS_WINDOWS = False
+        with mock.patch.object(self.mod.os, "replace", side_effect=PermissionError(13, "denied")) as rep:
+            with self.assertRaises(PermissionError):
+                self.mod.replace_file("a", "b")
+        self.assertEqual(rep.call_count, 1)
+
+    def test_settings_written_in_place_when_replace_keeps_failing(self):
+        path = os.path.join(self.tmp, "settings.json")
+        with open(path, "w") as fh:
+            json.dump({"model": "opus", "env": {"FOO": "1"}}, fh)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": self.tmp}), mock.patch.object(self.mod, "replace_file", side_effect=PermissionError(32, "in use")):
+            self.mod.write_settings({"AGENTGUARD_HOST": "https://h"}, [])
+        with open(path) as fh:
+            self.assertEqual(json.load(fh), {"model": "opus", "env": {"FOO": "1", "AGENTGUARD_HOST": "https://h"}})
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["settings.json", "settings.json.agentguard-backup"])
+
+    def test_hook_reads_stdin_as_utf8_bytes(self):
+        data = json.dumps({"session_id": "s", "transcript_path": "C:\\Users\\Jos\u00e9\\t.jsonl", "hook_event_name": "Stop"}, ensure_ascii=False).encode("utf-8")
+        stdin = mock.Mock()
+        stdin.buffer = io.BytesIO(b"\xef\xbb\xbf" + data)  # with a BOM, as PowerShell may add
+        env = {"AGENTGUARD_PUBLIC_KEY": "pk-lf-x", "AGENTGUARD_SECRET_KEY": "sk-lf-x", "AGENTGUARD_HOME": self.tmp, "AGENTGUARD_SYNC": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdin", stdin), mock.patch.object(self.mod, "run_worker") as run_worker:
+            self.mod.main([])
+        self.assertEqual(run_worker.call_args[0][0]["transcript_path"], "C:\\Users\\Jos\u00e9\\t.jsonl")
+
+    def test_status_shows_python(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AGENTGUARD_HOME": self.tmp, "CLAUDE_CONFIG_DIR": self.tmp}), mock.patch.object(sys, "stdout", out):
+            self.mod.status_main()
+        self.assertIn("Python: %s (" % sys.executable, out.getvalue())
 
 
 class SetupAndStatusTests(Base):
