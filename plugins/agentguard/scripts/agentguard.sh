@@ -14,6 +14,14 @@
 here=${0%[/\\]*}
 [ "$here" = "$0" ] && here=.
 script="$here/send_trace.py"
+# "codex" as the first argument selects the Codex adapter (Codex's notify runs
+# `sh agentguard.sh codex notify <json>`). The Claude Code hooks never pass it.
+quiet=
+if [ "${1:-}" = "codex" ]; then
+    shift
+    script="$here/codex_trace.py"
+    [ "${1:-}" = "notify" ] && quiet=1
+fi
 
 is_store_stub() {
     case $1 in
@@ -62,6 +70,7 @@ if find_python python3 || find_python python || find_python py -3; then
 fi
 
 [ $# -eq 0 ] && exit 0  # hook mode: stay silent
+[ -n "$quiet" ] && exit 0  # Codex notify: stay silent too
 
 # printf is a shell builtin: the message must not depend on any program on PATH.
 printf '%s\n' \

@@ -388,3 +388,437 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
   `claude plugin update` sees it. Added `LICENSE` (Apache 2.0, the canonical text, sha256
   `cfc7749b...3d30`), `"license": "Apache-2.0"` in plugin.json, and `CHANGELOG.md`.
 
+
+## 10. Phase 0 research: Codex, Cursor, Antigravity (2026-11-25, no code changed)
+
+Sources are the official docs and changelogs fetched on 2026-11-25 (none of the doc pages
+shows its own date), the openai/codex source at commit ebd0765, real local Codex files on
+this Mac, and the AgentGuard source (`~/Documents/Agentguard`). **Cursor and Antigravity are
+not installed on this Mac**, so their findings rest on the docs alone.
+
+### 10.1 Codex (local: VS Code extension openai.chatgpt 26.1120.x, bundled `codex-cli 0.171.0-alpha.13.2`)
+
+Docs moved: developers.openai.com/codex/* now redirects (308) to learn.chatgpt.com/docs/*.
+The changelog lists 0.171.0 on 2026-11-20.
+
+- **`notify`** (config-file/config-advanced#notifications):
+  - Format: `notify = ["prog", "arg", ...]` in the **user** `~/.codex/config.toml`; it is
+    ignored in a project config.
+  - Payload: "The script receives a single JSON argument", appended as the last argv entry;
+    stdin, stdout and stderr are null. Fields: `type` ("currently `agent-turn-complete`"),
+    `thread-id`, `turn-id`, `cwd`, `input-messages`, `last-assistant-message`, and in the
+    source an undocumented `client`.
+  - When: on every turn end. The IDE page (docs/notifications) says "configure `notify` on
+    the connected Codex host", so it also works for the extension.
+  - Codex starts the program and does not wait for it.
+  - Only ONE program is allowed, so we must wrap and chain to an existing one.
+  - Not deprecated in the docs, but the source calls it "legacy" with a removal TODO.
+- **Hooks** (docs/hooks):
+  - Location: `$CODEX_HOME/hooks.json` or `[hooks]` in config.toml; also system, project
+    and plugin hooks.
+  - On by default, but every non-managed hook needs a **one-time trust review** (`/hooks`
+    in the CLI, Settings > Hooks in the app) and is skipped until trusted.
+  - Events: SessionStart, SessionEnd, SubagentStart, SubagentStop, UserPromptSubmit,
+    PreToolUse, PermissionRequest, PostToolUse, Pre/PostCompact, Stop, Interrupt,
+    Pre/PostModelRequest.
+  - Input: JSON on stdin with `session_id`, `transcript_path` (the rollout file), `cwd`,
+    `hook_event_name`, `model`, plus `turn_id`. `PostModelRequest` carries `token_usage`.
+  - Neutral output: exit 0 and print nothing. Codex waits for the hook unless it has
+    `async: true`. Timeouts: 600 s by default; SessionEnd 1 s (max 3 s).
+  - Documented for the CLI and the desktop app. **Not documented for the IDE extension.**
+- **Rollout files:**
+  - Location: `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread id>.jsonl`; 81 local
+    files.
+  - Officially "not a stable interface ... may change".
+  - Since 0.158 new threads use "paginated history": the rollout files are still written,
+    but in a new line format, and a SQLite projection (`thread_history_1.sqlite`, holding
+    byte offsets into the rollout files) sits beside them.
+  - Codex migrates legacy files at startup by **rewriting and renaming** them, and
+    compresses rollouts older than 7 days to `.jsonl.zst` (zstd is not in the stdlib before
+    3.14). So **byte offsets are not safe cursors**: use the per-line `ordinal` field.
+  - `CODEX_HOME` moves `~/.codex` for the CLI, IDE extension and app-server.
+  - Observed structure (20 newest files, `cli_version` 0.159 to 0.164, originator
+    `codex_vscode`). Every line is `{timestamp, type, payload, ordinal, metadata}`:
+    - `session_meta`: id, cwd, git, `source` (`vscode` or `{subagent: guardian}`),
+      `parent_thread_id`, `cli_version`.
+    - `event_msg/task_started` and `task_complete` with `turn_id`, `started_at`,
+      `completed_at`, `duration_ms` (the turn boundaries).
+    - `turn_context` with `model` and `effort` per turn.
+    - `response_item` of type `message`, `reasoning`, `function_call` /
+      `custom_tool_call` (`call_id`, `name`) and `*_output` (`call_id`).
+    - `event_msg/item_completed` with `started_at_ms` and `completed_at_ms`.
+    - **`token_usage_record`: exactly one per model response** (1093 of 1093), with
+      `response_id`, `turn_id` and `usage{input_tokens, cached_input_tokens,
+      cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens}`.
+  - Models seen: `gpt-6.1-sol`, and `codex-auto-review` (the guardian review subagent,
+    written as its own rollout file with `parent_thread_id`).
+- **Token semantics:**
+  - `cached_input_tokens <= input_tokens` and `reasoning_output_tokens <= output_tokens`
+    in every record, and `total == input + output` in all 1967 records. The source computes
+    `non_cached_input = input_tokens - cached_input_tokens`. So cached tokens are **inside**
+    input and reasoning tokens **inside** output, as in the OpenAI Responses API.
+  - `cache_write_input_tokens` was 0 in all 1967 local records, and its relation to input
+    is undocumented. Assumption: it is inside `input_tokens`.
+  - `service_tier` (fast/flex/priority) is **not** recorded per turn in the rollout file;
+    it is only in OTel.
+- **OpenTelemetry:**
+  - Config: `[otel]`, disabled by default; `otlp-http` or `otlp-grpc`, posting directly
+    with static `headers` (supports `${ENV}`), so no collector is needed.
+  - It exports logs (`codex.api_request`, `codex.sse_event` with token counts and
+    `service_tier`, `codex.tool_result` snippets, user prompts redacted by default),
+    traces (`gen_ai.usage.*`) and metrics.
+  - **AgentGuard has OTLP traces and metrics endpoints, but no logs endpoint.**
+  - Span names and structure are Codex's own, so we would not control
+    `codex.turn`/`codex.llm_call`, tags or ids.
+- **Shared state:** "the CLI, IDE extension, and ChatGPT desktop app all share the same
+  configuration layers". The desktop app is now the ChatGPT desktop app's Codex mode.
+- **AgentGuard price table:**
+  - `gpt-6.1-sol` exists, priced on `input`, `input_cached_tokens`,
+    `input_cache_write_tokens`, `output` and `output_reasoning_tokens`, among others.
+  - Tiers are chosen by `model_parameters.service_tier` and by >272K input.
+  - **`codex-auto-review` has no entry**, so guardian reviews would cost 0.
+
+### 10.2 Cursor (docs only: cursor.com/docs/hooks, /docs/reference/third-party-hooks, CLI changelog to v2026.11.19)
+
+- **Locations:**
+  - User `~/.cursor/hooks.json`; project `.cursor/hooks.json`; team (enterprise);
+    enterprise (`/Library/Application Support/Cursor/hooks.json` and others).
+  - All sources run; the order is Enterprise > Team > Project > User.
+  - Format `{"version": 1, "hooks": {"<event>": [{"command", "timeout"?, "matcher"?,
+    "failClosed"?}]}}`. User hooks run from `~/.cursor/`.
+  - The file is watched and reloaded, so write it atomically.
+  - On Windows the desktop app runs hooks through PowerShell. Other shells are not
+    documented.
+- **Common input:** `conversation_id` (stable across turns), `generation_id` (new for every
+  user message), `model` (and `model_id`), `hook_event_name`, `cursor_version`,
+  `workspace_roots`, `user_email` (may be null), `transcript_path` (null if transcripts are
+  off; format undocumented).
+- **Events useful for tracing, all observe-only:**
+  - `sessionStart` / `sessionEnd` (fire-and-forget; `duration_ms`, `reason`).
+  - `postToolUse` / `postToolUseFailure` (`tool_name`, `tool_use_id`, `tool_input`,
+    `tool_output`, `duration`).
+  - `afterShellExecution`, `afterMCPExecution`, `afterFileEdit`, `afterAgentResponse`
+    (`text`), `afterAgentThought`.
+  - `subagentStop` (`duration_ms`, counts, `agent_transcript_path`).
+  - `stop` (`status`, `loop_count`).
+- **Neutral output:** `{}` for these events, or nothing at exit 0.
+- **Never use permission hooks** (`beforeShellExecution`, `beforeMCPExecution`,
+  `beforeReadFile`, `preToolUse`, `subagentStart`, `beforeTabFileRead`): invalid JSON there
+  **blocks**, and exit 2 blocks. Never set `failClosed`. Never output `followup_message`,
+  `additional_context`, `env`, `user_message`, `agent_message` or `updated_*`.
+- **Model:** yes, per event. **Token usage, cost and reasoning tokens:** not in the hooks
+  reference.
+  - The CLI changelog (March 2026) claims "per-turn token usage" in hook payloads, but no
+    field is documented, so it is treated as unavailable.
+  - Real per-request tokens exist only in the Enterprise OTel export and the Enterprise
+    Admin API (hourly aggregates).
+- **Not covered:**
+  - Cloud agents do not run user hooks.
+  - The first prompt after a restart may run before the hooks have loaded.
+- **Risk to the existing Claude plugin:** with "Include Third-Party Plugins, Skills, and
+  Other Configs" (on by default), Cursor **runs Claude Code hooks** from
+  `~/.claude/settings.json` and `.claude/settings*.json`, and the CLI changelog
+  (2026-05-07) says "Plugins imported from Claude Code appear alongside native ones".
+  - Whether Cursor runs an imported Claude plugin's `hooks.json` (our Stop/SessionEnd hook)
+    is **not documented**.
+  - If it does, the Claude adapter would receive Cursor payloads and a Cursor transcript
+    ("Claude Code-compatible JSONL" for headless runs). It would send them as
+    `claude_code.turn` traces, duplicating the Cursor adapter.
+  - Cannot be tested here: Cursor is not installed.
+
+### 10.3 Antigravity (docs only: antigravity.google/docs, changelog: App v2.35.1 and CLI `agy` v1.5.16, both 2026-11-24)
+
+- **Documented hooks** (docs/hooks):
+  - Location: `~/.gemini/config/hooks.json` (global), `.agents/hooks.json` (workspace),
+    and plugin hooks.
+  - Events: `SessionStart`, `PreToolUse`, `PostToolUse`, `PreInvocation`,
+    `PostInvocation` (around each model call), `Stop`.
+  - Handler: `{"type":"command","command","timeout":30}`; JSON on stdin and stdout.
+  - Fields: `conversationId`, `workspacePaths`, `transcriptPath`, `artifactDirectoryPath`,
+    `modelName`, `lastUserInput`. Tool hooks add `toolCall{name,args}`, `stepIdx` and
+    `error`; `Stop` adds `terminationReason` and `executionNum`. CLI v1.5.4 to 1.5.6 added
+    `hookEventName`, `cwd`, `toolCall.id` and `continuation_active`, so the fields are
+    still changing.
+- **No token, usage or cost fields** in any hook.
+- **No OTel export:** an open request exists, google-antigravity/antigravity-cli#366.
+- **No extension API** for observing the agent.
+- **Transcript:** the path is documented (`<app_data_dir>/brain/<id>/.system_generated/logs/transcript.jsonl`),
+  the format is not.
+- **CLI tokens:** `agy -p --output-format stream-json` reports per-step `usage`
+  (input/output/thinking/cache_read), for headless CLI runs only.
+- The documented neutral output of each hook is not fully confirmed (to check against the
+  page before building).
+
+### 10.4 What each tool can give AgentGuard
+
+| Data | Claude Code (today) | Codex | Cursor | Antigravity |
+|---|---|---|---|---|
+| Session id | yes | yes (thread id) | yes (`conversation_id`) | yes (`conversationId`) |
+| Turn boundaries | yes | yes (`task_started`/`task_complete`) | yes (`generation_id`, `stop`) | partly (`Stop`, `lastUserInput`) |
+| User | git email | git email (only ChatGPT account ids in the file) | `user_email` (may be null) | git email |
+| Model | yes | yes (per turn) | yes (per event) | yes (`modelName`) |
+| Input / output tokens | yes | yes, per response | **no** | **no** (IDE/App) |
+| Cached tokens | yes (read and write by TTL) | yes (read; write always 0 here) | **no** | **no** |
+| Reasoning tokens | n/a (in output) | yes | **no** | **no** |
+| Cost in AgentGuard | yes | yes for `gpt-6.1-sol`; **0 for `codex-auto-review`**; fast/priority tier not detectable | **no** | **no** |
+| Tool calls | yes, with duration | yes (`call_id`, timing from `item_completed`) | yes (`postToolUse`, duration) | yes (`Pre`/`PostToolUse`) |
+| Timing | per response | per turn and per item | per tool; per turn from hook times | per model call (`Pre`/`PostInvocation`) |
+| Content (opt-in) | yes | yes (rollout) | yes (hook payloads) | partly (`lastUserInput`, tool args) |
+| Subagents | yes | yes (guardian threads, `parent_thread_id`) | `subagentStop` | not documented |
+| Trigger | Stop/SessionEnd hook | `notify` (or hooks) | user hooks | user hooks |
+| Stability | documented | notify documented ("legacy" in source); rollout format explicitly unstable | hooks documented | hooks documented, fields still changing |
+
+### 10.5 Proposed design, adjusted to the findings (awaiting approval)
+
+- **Phase 1, shared core:** as planned.
+  - A new `plugins/agentguard/scripts/agentguard_core.py` holds config, redaction, HTTP
+    plus budget, batching, the locked state file, the error log, the detached spawn and
+    the status helpers.
+  - `send_trace.py` imports it and keeps every path, the state format and its outputs.
+  - New agents keep their state in `~/.agentguard/state/<agent>.json`.
+  - A golden test compares the full fixture payload before and after the refactor.
+- **Phase 2, Codex:** `notify` (chaining any existing program) plus incremental reading of
+  the rollout file.
+  - Why not hooks: they need a trust review per hook, and are not documented for the IDE
+    extension, which is how Codex is used here.
+  - Why not OTel: AgentGuard has no logs endpoint, and OTel gives no control over trace
+    names, tags or ids.
+  - Robustness:
+    - The cursor is the thread id plus the last processed `ordinal`, never a byte offset,
+      and the file is found again by thread id under `sessions/`.
+    - A rewritten file is simply read again; ids are deterministic.
+    - `.jsonl.zst` files are skipped, with a status note.
+    - Unknown line types are ignored.
+  - Usage per `token_usage_record` (one constant, `CODEX_USAGE_KEYS`):
+    - `input = input_tokens - cached_input_tokens - cache_write_input_tokens`
+    - `input_cached_tokens = cached_input_tokens`
+    - `input_cache_write_tokens = cache_write_input_tokens`
+    - `output = output_tokens - reasoning_output_tokens`
+    - `output_reasoning_tokens = reasoning_output_tokens`
+    - Ids are `codex:<thread id>`; names `codex.turn`, `codex.llm_call`, tool spans; tag
+      `codex`. Guardian subagent threads nest under their parent turn.
+- **Phase 3, Cursor:** user `~/.cursor/hooks.json` only, merged, written atomically, with a
+  backup.
+  - Events: `afterAgentResponse`, `postToolUse`, `postToolUseFailure`, `subagentStop`,
+    `stop`, `sessionEnd`; no permission hooks.
+  - Each hook appends its input to a local spool and exits 0 with `{}`. A detached worker
+    turns the spool into traces: `generation_id` gives the trace, `conversation_id` the
+    session (`cursor:<id>`).
+  - No usage numbers; `usage_available=false`.
+- **Guard in the Claude adapter (needs approval):** if the hook input or environment shows
+  Cursor (`cursor_version`, `CURSOR_*`), exit 0 without doing anything. Claude Code itself
+  never sets these, so Claude behaviour does not change. This stops Cursor from sending
+  Cursor sessions as `claude_code.turn` if it runs our imported plugin hooks.
+- **Phase 4, Antigravity:** documented hooks exist, so a hooks-based adapter like Cursor's
+  is possible.
+  - It would carry model, tool calls and timing, with no tokens or cost.
+  - It cannot be tested on this Mac.
+  - Building it or writing "not supported yet" is the user's decision.
+- **Phase 5:** as planned. One addition: setup must tell the developer to approve nothing
+  for notify, and to restart Codex, Cursor and Antigravity.
+
+### 10.6 Decisions (user, 2026-11-25)
+
+1. **Codex: use Codex hooks**, not notify or OTel.
+   - Consequences: each developer approves the hook once (`/hooks` in the CLI, Settings >
+     Hooks in the app).
+   - Support in the IDE extension is not documented, so it is tested first in Phase 2.
+   - `transcript_path` (the rollout file) and `PostModelRequest.token_usage` are
+     available.
+2. **Antigravity: build the hooks-only adapter** (model, tool calls, timing; no tokens or
+   cost).
+3. **Claude adapter: add the Cursor guard.** Input that comes from Cursor is ignored. It is
+   built in Phase 3 together with the Cursor adapter, so Phase 1 stays a pure refactor.
+4. Phase 1 approved.
+
+Still open for the AgentGuard server team: a price for `codex-auto-review`, and pricing of
+Codex fast/priority turns.
+
+### 10.7 Open questions at the end of Phase 0 (answered above)
+
+1. Codex trigger: `notify` plus rollout file (recommended), hooks, or OTel?
+2. Antigravity: build the hooks-only adapter (no cost data), or document "not supported
+   yet"?
+3. May the Claude adapter ignore input that comes from Cursor (the guard above)?
+4. AgentGuard server team:
+   - add a price for `codex-auto-review`;
+   - decide how to price Codex fast/priority turns, since `service_tier` is not in the
+     rollout file.
+5. Real end-to-end tests need Cursor and Antigravity installed on a test machine (they are
+   not on this Mac).
+
+## 11. Phase 1: shared core (2026-11-25)
+
+- **`plugins/agentguard/scripts/agentguard_core.py`** holds the agent-independent parts:
+  - config and timeout parsing, redaction and masking,
+  - the error log with rotation, and Windows-safe `replace_file`,
+  - the state file (load, save, cleanup) and `file_lock`,
+  - HTTP, `split_batches`, the `Sender` with its time budget, `envelope` and `det_id`,
+  - the detached spawn (`spawn_detached`) and `resolve_user`,
+  - the key test, and the collector check for status output.
+
+  It lives in the plugin's `scripts/` folder because the Claude plugin installer copies only
+  the plugin folder. Checked: an install into a separate `CLAUDE_CONFIG_DIR` copies
+  `agentguard_core.py`, and the installed hook command runs.
+- **Explicit arguments, no globals.** The core functions take everything that differs
+  between agents as arguments: paths, `is_windows`, the logger, the User-Agent, batch
+  limits. Each adapter keeps its own files.
+- **The Claude adapter is unchanged on the outside.** `send_trace.py` keeps every name it
+  had, as aliases of the core or as thin wrappers that pass its own values (Claude paths,
+  `IS_WINDOWS`, `MAX_BATCH_*`, `ERROR_LOG_MAX_BYTES`, `OTEL_COLLECTOR_PORT`, the
+  `agentguard-claude-code/<version>` User-Agent). Existing tests change these names on the
+  module and keep working unmodified. Its paths, state location and format, and outputs did
+  not change.
+- **Golden test** (`tests/test_golden.py`, `tests/fixtures/golden/`):
+  - The complete ingestion payload for the fixture transcript, with content logging off and
+    on, recorded from the 0.1.1 code before the refactor: 14 events each.
+  - The refactored code reproduces it exactly, after sorting.
+  - Envelope timestamps are left out (they are the send time), and the plugin version
+    becomes a placeholder.
+  - Each envelope id is checked to be the hash of its body.
+- **New adapters** keep their state in `~/.agentguard/state/<agent>.json` (Phase 2 onward).
+  The Claude adapter keeps `~/.claude/agentguard/state.json`.
+
+## 12. Phase 2: Codex trigger, tested on this Mac (2026-11-25, Codex 0.171.0-alpha.13.2)
+
+- **Hooks (the first decision) do not work for the VS Code extension in practice.**
+  - The extension never shows the trust review. Untrusted hooks are skipped **silently**,
+    and the Codex logs show no message either.
+  - A probe in `~/.codex/hooks.json` (7 events) never ran in 4 extension turns, nor in the
+    CLI while untrusted. Trust is stored in the user `config.toml` as
+    `[hooks.state."<key>"] trusted_hash = "sha256:..."` (codex-rs/hooks/src/config_rules.rs).
+  - The CLI's "Hooks need review" screen did not save a trust in several attempts: the logs
+    show only `hooks/list` calls and no write.
+  - Writing the trust ourselves would replace Codex's safety review, so we don't.
+  - **Decision (user, 2026-11-25): switch to `notify`.**
+- **`notify` verified** with a probe (`notify = [python, probe]` at the top of `config.toml`;
+  removed afterwards, and the file is byte-for-byte as before):
+  - It fires after every turn **in the CLI (`client: "codex-tui"`) and in the VS Code
+    extension (`client: "VS Code"`)**, with no trust step.
+  - The payload is the last argv entry, with `type: agent-turn-complete`, `thread-id`,
+    `turn-id`, `cwd`, `client`, `input-messages` and `last-assistant-message`.
+  - The session file is found from `thread-id` alone
+    (`sessions/*/*/*/rollout-*<thread-id>.jsonl`).
+  - Each turn also produced a second notify for a short-lived helper thread **with no
+    session file**; it is skipped.
+  - The environment holds **no `AGENTGUARD_*` variables**, so keys come from
+    `~/.agentguard/config.json` (Phase 5).
+- **Format check on 0.171:** same structure as 0.159 to 0.164. New lines
+  `event_msg/user_message` and `event_msg/agent_message` duplicate the `response_item`
+  messages; the adapter counts from `response_item` only.
+- **Guardian review threads** (model `codex-auto-review`, 45 of 81 local threads) are
+  separate rollout files in the **same day folder** as their parent, with `session_id` set
+  to the parent thread and `parent_thread_id`. The parent file never mentions them. The
+  adapter finds them by reading the first line of new files in that folder, and nests them
+  under the parent turn running at that time.
+- **Failed commands:** `item_completed` CommandExecution items carry `status: failed` and an
+  `exit_code`, but their ids do not match tool `call_id`s. So failures are counted on the
+  turn (`commands_failed`), not marked on spans.
+
+## 13. Phase 2: Codex adapter (2026-11-25)
+
+`plugins/agentguard/scripts/codex_trace.py` (uses `agentguard_core.py`).
+
+- **Trigger:** Codex `notify`. Codex appends the JSON payload as the last argument.
+  - `codex_trace.py notify '<json>'` first runs the developer's previous notify program,
+    if setup saved one (`~/.agentguard/config.json` → `codex.chain_notify`), detached, with
+    the same argument and environment.
+  - It then hands the work to a detached `--worker`, and exits 0 with no output.
+  - Keys come from the environment, else `~/.agentguard/config.json` (`load_config` in the
+    core).
+- **Files:**
+  - state `~/.agentguard/state/codex.json` (lock `codex.lock`)
+  - errors `~/.agentguard/logs/codex.log`
+- **Mapping:**
+  - Session `codex:<thread id>`. One trace `codex.turn` per turn (`task_started` to
+    `task_complete` or `turn_aborted`), tag `codex`.
+  - One generation `codex.llm_call` per model response, and one span per tool call (named
+    after the tool, child of the response that made it).
+  - Guardian review threads become a `codex.subagent` span inside the parent turn running
+    at that time, with their own generations under it.
+  - Ids are `det_id("codex", session, ...)` of Codex's own ids (turn id, `response_id`,
+    `call_id`).
+- **Usage keys for the AgentGuard price table** (constant `CODEX_USAGE_KEYS`):
+
+  | usageDetails key | value |
+  |---|---|
+  | `input` | `input_tokens - cached_input_tokens - cache_write_input_tokens` |
+  | `input_cached_tokens` | `cached_input_tokens` |
+  | `input_cache_write_tokens` | `cache_write_input_tokens` (only when > 0) |
+  | `output` | `output_tokens - reasoning_output_tokens` |
+  | `output_reasoning_tokens` | `reasoning_output_tokens` (only when > 0) |
+
+  Models seen locally, all priced under these keys: `gpt-6.2-sol`, `gpt-6.1-sol`,
+  `gpt-5.6-sol`, `gpt-6-luna` and `gpt-6-astra`. **`codex-auto-review` has no price** (389
+  local generations), which is for the server team. `service_tier` is not in the rollout
+  file, so fast and flex turns are priced at the standard rate.
+- **Older Codex files:** before `token_usage_record` existed, each response appears only as
+  a `token_count` whose running total changed.
+  - The adapter uses those until a file's first record, then records only. The total can
+    also fall (after a reset), so "changed" is the test, not "grew".
+  - Checked on 64 local files with both kinds of line: one-to-one, identical numbers.
+- **Cursor in a file:** the byte offset plus the last `ordinal`. Lines whose ordinal is not
+  newer are skipped. If the offset lands mid-line, which happens after Codex rewrites a
+  file, it reads again from the start.
+- **Guardian threads:** found in the parent's day folder **and later ones** (up to 31
+  days), because a long session's reviews land in the folder of the day they ran. Each
+  file's first line is read once and remembered.
+- **Checked against every local thread:** for all 43 main threads, the input, output,
+  cached and reasoning tokens sent equal Codex's own per-response usage, guardian threads
+  included. All 389 guardian generations are nested. No errors, no output.
+- **`configure_notify` / `remove_notify`** (used by setup in Phase 5):
+  - Edits only the top-level `notify` line of `~/.codex/config.toml`: adds it above the
+    first table, or replaces it and returns the old argv to chain.
+  - Idempotent. Keeps CRLF. Writes a backup once (`config.toml.agentguard-backup`) and
+    writes atomically.
+  - A multi-line or non-string `notify` is left alone, with a message.
+- **Left for Phase 5:**
+  - the launcher argv written into `notify`;
+  - on Windows, notify runs a program directly, so it must be a real `.exe`; consider
+    `pythonw.exe` to avoid a console window;
+  - setup saving the chained program and the keys in `~/.agentguard/config.json`;
+  - a real Codex session in AgentGuard (the organization's plan currently refuses data with
+    HTTP 403).
+
+### 13.1 Codex on Windows, and setup (2026-11-26)
+
+- **notify command per platform** (`notify_argv`; Codex appends the JSON):
+  - **macOS / Linux:** `["/bin/sh", "~/.agentguard/scripts/agentguard.sh", "codex", "notify"]`.
+    The launcher finds Python on every run, so a Homebrew upgrade can't break it, and stays
+    silent when none is found.
+  - **Windows:** Codex starts the program directly, so it must be a real `.exe`, and one that
+    opens no console window after every turn:
+    - `[pyw.exe, "-3", codex_trace.py, "notify"]` when `py -3` is Python 3.8 or newer;
+      `pyw.exe` is the windowless launcher and survives Python upgrades;
+    - else `[pythonw.exe next to the Python that ran setup, codex_trace.py, "notify"]`.
+    - Not `powershell -File`: Windows PowerShell 5.1 can mangle quotes inside a JSON
+      argument.
+  - Status warns when the configured program no longer exists.
+- **Stable location:** setup copies `agentguard_core.py`, `codex_trace.py` and both launchers
+  to `~/.agentguard/scripts/`. The Claude plugin's folder contains the plugin version, so it
+  changes on every update.
+- **Launchers:** a first argument `codex` runs `codex_trace.py` with the remaining
+  arguments. `codex notify` with no Python is silent and exits 0. The Claude hooks never
+  pass `codex`; existing launcher and golden tests unchanged and passing.
+- **`codex_trace.py --setup`** (also what `agentguard setup` will call):
+  - Takes the keys from a hidden prompt, from `--secret-stdin`, or keeps saved ones, and
+    tests them first. Wrong keys change nothing.
+  - Saves them in `~/.agentguard/config.json`, created with mode 0600 and written
+    atomically. On Windows the user profile is already private to the user.
+  - Copies the scripts, writes `notify`, and saves a previous notify program in
+    `codex.chain_notify`.
+  - Idempotent.
+- **`--uninstall`** restores the previous notify program, or removes our line, and keeps the
+  keys and scripts for other tools.
+- **Tests** (`tests/test_codex.py`):
+  - setup, then run the **exact argv written into config.toml** plus a payload, as Codex
+    does, with keys only in the config file: the data arrives;
+  - chaining and its restore;
+  - wrong keys;
+  - running setup twice;
+  - the config file mode;
+  - the Windows choice between `pyw` and `pythonw` (mocked);
+  - launcher dispatch on POSIX, and on PowerShell (where PowerShell exists).
+
+  On the Windows CI runner the end-to-end test goes through the real `pyw.exe` /
+  `pythonw.exe`.

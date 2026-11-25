@@ -19,6 +19,15 @@ if ($PSScriptRoot) { $here = $PSScriptRoot }
 elseif ($env:CLAUDE_PLUGIN_ROOT) { $here = Join-Path $env:CLAUDE_PLUGIN_ROOT 'scripts' }
 else { $here = '.' }
 $script = Join-Path $here 'send_trace.py'
+$rest = @($args)
+$quiet = $false
+# "codex" as the first argument selects the Codex adapter (status and setup; Codex's notify
+# on Windows starts pyw.exe or pythonw.exe directly). The Claude Code hooks never pass it.
+if ($args.Count -gt 0 -and $args[0] -eq 'codex') {
+    $script = Join-Path $here 'codex_trace.py'
+    $rest = @($args | Select-Object -Skip 1)
+    $quiet = ($rest.Count -gt 0 -and $rest[0] -eq 'notify')
+}
 
 function Test-StoreStub([string]$path) {
     if ($path -notmatch '[\\/]WindowsApps[\\/]') { return $false }
@@ -45,7 +54,7 @@ foreach ($candidate in @(@('python3'), @('python'), @('py', '-3'))) {
 }
 
 if (-not $py) {
-    if ($hookMode) { exit 0 }
+    if ($hookMode -or $quiet) { exit 0 }
     Write-Output @'
 AgentGuard needs Python 3.8 or newer, and none was found.
 Tried: python3, python, py -3 (Microsoft Store shortcuts that only open the Store are skipped).
@@ -58,12 +67,12 @@ Install Python, then restart Claude Code:
 
 Until then the plugin sends nothing, and Claude Code works normally.
 '@
-    if ($args[0] -eq '--status') { exit 0 }
+    if ($rest.Count -gt 0 -and $rest[0] -eq '--status') { exit 0 }
     exit 1
 }
 
 $utf8 = New-Object System.Text.UTF8Encoding $false
-if ($hookMode -or ($args -contains '--secret-stdin')) {
+if ($hookMode -or ($rest -contains '--secret-stdin')) {
     # Pass stdin on as UTF-8 bytes. PowerShell does not hand its own stdin to child processes
     # reliably, and Windows PowerShell 5.1 would otherwise re-encode it as ASCII.
     try {
@@ -76,7 +85,7 @@ if ($hookMode -or ($args -contains '--secret-stdin')) {
             $text | & $py @pre $script *> $null
             exit 0
         }
-        $text | & $py @pre $script @args
+        $text | & $py @pre $script @rest
         exit $LASTEXITCODE
     } catch {
         if ($hookMode) { exit 0 }
@@ -85,5 +94,5 @@ if ($hookMode -or ($args -contains '--secret-stdin')) {
     }
 }
 
-& $py @pre $script @args
+& $py @pre $script @rest
 exit $LASTEXITCODE
