@@ -568,6 +568,15 @@ class FailureTests(Base):
         self.assertNotIn("sk-lf-wrong-key-123456", log)
         self.assertNotIn("sk-lf-wrong-key-123456", json.dumps(self.state()))
 
+    def test_403_points_to_the_server_message_not_the_keys(self):
+        self.server.status = 403
+        proc, _ = self.run_hook()
+        self.assertQuietSuccess(proc)
+        self.assertEqual(self.offset(), 0)
+        detail = self.state()["last_send"]["detail"]
+        self.assertIn("HTTP 403: fake failure (AgentGuard refused the data; see its message)", detail)
+        self.assertNotIn("check AGENTGUARD_PUBLIC_KEY", detail)
+
     def test_server_down(self):
         proc, elapsed = self.run_hook(AGENTGUARD_HOST="http://127.0.0.1:%d" % free_port())
         self.assertQuietSuccess(proc)
@@ -575,11 +584,11 @@ class FailureTests(Base):
         self.assertFalse(self.state()["last_send"]["ok"])
         self.assertLess(elapsed, 5)
 
-    def test_timeout_is_three_seconds(self):
+    def test_timeout_limits_the_run(self):
         self.server.delay = 6
-        proc, elapsed = self.run_hook()
+        proc, elapsed = self.run_hook(AGENTGUARD_TIMEOUT_SECONDS="2")
         self.assertQuietSuccess(proc)
-        self.assertLess(elapsed, 5.0)
+        self.assertLess(elapsed, 4.0)
         self.assertEqual(self.offset(), 0)
         self.assertIn("timed out", self.error_log().lower())
 
@@ -664,8 +673,69 @@ class FailureTests(Base):
         self.assertLess(os.path.getsize(os.path.join(self.home, "error.log")), 1200)
 
 
+class TimeoutTests(Base):
+    """AGENTGUARD_TIMEOUT_SECONDS: the total time one run may spend sending."""
+
+    def test_default_is_15_seconds(self):
+        cfg = self.mod.Config({})
+        self.assertEqual((cfg.timeout, cfg.timeout_warning), (15.0, None))
+        self.assertEqual(self.mod.Sender(cfg).budget, 15.0)
+
+    def test_custom_values(self):
+        for raw, expected in (("30", 30.0), (" 2.5 ", 2.5), ("1", 1.0), ("60", 60.0)):
+            cfg = self.mod.Config({"AGENTGUARD_TIMEOUT_SECONDS": raw})
+            self.assertEqual((cfg.timeout, cfg.timeout_warning), (expected, None), raw)
+
+    def test_out_of_range_falls_back(self):
+        for raw in ("0", "0.5", "61", "-3", "inf"):
+            cfg = self.mod.Config({"AGENTGUARD_TIMEOUT_SECONDS": raw})
+            self.assertEqual(cfg.timeout, 15.0, raw)
+            self.assertIn("is not a number from 1 to 60; using 15", cfg.timeout_warning)
+
+    def test_invalid_text_falls_back(self):
+        for raw in ("abc", "nan", "15s", "1e"):
+            cfg = self.mod.Config({"AGENTGUARD_TIMEOUT_SECONDS": raw})
+            self.assertEqual(cfg.timeout, 15.0, raw)
+            self.assertTrue(cfg.timeout_warning, raw)
+
+    def test_invalid_value_is_logged_once(self):
+        for _ in range(3):
+            proc, _ = self.run_hook(AGENTGUARD_TIMEOUT_SECONDS="abc")
+            self.assertQuietSuccess(proc)
+        self.assertEqual(self.error_log().count("AGENTGUARD_TIMEOUT_SECONDS='abc'"), 1)
+        self.run_hook(AGENTGUARD_TIMEOUT_SECONDS="999")  # a different bad value is logged again
+        self.assertEqual(self.error_log().count("AGENTGUARD_TIMEOUT_SECONDS="), 2)
+        self.assertEqual(len(self.by_type("generation-create")), 7)  # and sending still works
+
+    def test_slow_server_succeeds_with_default(self):
+        self.server.delay = 5
+        proc, elapsed = self.run_hook()
+        self.assertQuietSuccess(proc)
+        self.assertGreaterEqual(elapsed, 5)
+        self.assertGreater(self.offset(), 0)
+        self.assertTrue(self.state()["last_send"]["ok"])
+        self.assertEqual(len(self.by_type("generation-create")), 7)
+
+    def test_slow_server_fails_with_2_seconds_and_is_retried(self):
+        self.server.delay = 5
+        proc, elapsed = self.run_hook(AGENTGUARD_TIMEOUT_SECONDS="2")
+        self.assertQuietSuccess(proc)
+        self.assertLess(elapsed, 4.5)
+        self.assertEqual(self.offset(), 0)
+        last = self.state()["last_send"]
+        self.assertFalse(last["ok"])
+        self.assertIn("timed out", last["detail"].lower())
+
+    def test_status_shows_timeout(self):
+        out = subprocess.run([sys.executable, SCRIPT, "--status"], env=self.env(AGENTGUARD_TIMEOUT_SECONDS="25"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30).stdout.decode()
+        self.assertIn("Timeout: 25s for all requests in one send (AGENTGUARD_TIMEOUT_SECONDS)", out)
+        out = subprocess.run([sys.executable, SCRIPT, "--status"], env=self.env(AGENTGUARD_TIMEOUT_SECONDS="zero"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30).stdout.decode()
+        self.assertIn("Timeout: 15s", out)
+        self.assertIn("WARNING: AGENTGUARD_TIMEOUT_SECONDS='zero'", out)
+
+
 class DetachTests(Base):
-    server_delay = 0.7  # slower than the hook may take, well inside the 3 s budget
+    server_delay = 0.7  # slower than the hook may take, well inside the default budget
 
     def test_hook_returns_immediately_and_worker_sends(self):
         proc, elapsed = self.run_hook(AGENTGUARD_SYNC=None)
@@ -844,6 +914,11 @@ class PluginFilesTests(unittest.TestCase):
             market = json.load(fh)
         self.assertEqual(plugin["name"], "agentguard")
         self.assertEqual(plugin["version"], mod.PLUGIN_VERSION)
+        self.assertEqual(plugin["license"], "Apache-2.0")
+        with open(os.path.join(ROOT, "LICENSE")) as fh:
+            self.assertIn("Apache License", fh.read(200))
+        with open(os.path.join(ROOT, "CHANGELOG.md")) as fh:
+            self.assertIn("## %s" % mod.PLUGIN_VERSION, fh.read())
         self.assertEqual(market["name"], "actaclad")
         entry = market["plugins"][0]
         self.assertEqual(entry["name"], "agentguard")
@@ -880,6 +955,201 @@ class PluginFilesTests(unittest.TestCase):
         for path in (SCRIPT,):
             with open(path) as fh:
                 ast.parse(fh.read(), feature_version=(3, 8))
+
+
+class StatusSourcesTests(Base):
+    """--status shows keys from the environment, or else from settings.json's env block."""
+
+    ENV_PK = "pk-ag-11110000-aaaa-4bbb-8ccc-00000000aaaa"
+    ENV_SK = "sk-ag-22220000-aaaa-4bbb-8ccc-00000000bbbb"
+    FILE_PK = "pk-ag-08710000-dddd-4eee-8fff-000000003dd3"
+    FILE_SK = "sk-ag-99990000-dddd-4eee-8fff-00000000cafe"
+
+    def status(self, settings=None, raw_settings=None, **env):
+        path = os.path.join(self.claude_dir, "settings.json")
+        if raw_settings is not None:
+            with open(path, "w") as fh:
+                fh.write(raw_settings)
+        elif settings is not None:
+            with open(path, "w") as fh:
+                json.dump(settings, fh)
+        env.setdefault("CLAUDECODE", None)  # as in a plain terminal
+        p = subprocess.run([sys.executable, SCRIPT, "--status"], env=self.env(**env), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = p.stdout.decode()
+        for secret in (self.ENV_SK, self.FILE_SK):
+            self.assertNotIn(secret, out)
+        with open(path) if os.path.exists(path) else io.StringIO("") as fh:
+            before = fh.read()
+        return out, before
+
+    def test_keys_only_in_environment(self):
+        out, _ = self.status(AGENTGUARD_PUBLIC_KEY=self.ENV_PK, AGENTGUARD_SECRET_KEY=self.ENV_SK)
+        self.assertIn("Public key: pk-ag-...aaaa (from the environment)", out)
+        self.assertIn("Secret key: set (ends ...bbbb) (from the environment)", out)
+        self.assertNotIn("Keys are not set", out)
+
+    def test_keys_only_in_settings_json(self):
+        settings = {"model": "opus", "env": {"AGENTGUARD_HOST": "https://ag.example.com", "AGENTGUARD_PUBLIC_KEY": self.FILE_PK, "AGENTGUARD_SECRET_KEY": self.FILE_SK, "AGENTGUARD_TIMEOUT_SECONDS": 20}}
+        out, _ = self.status(settings, AGENTGUARD_HOST=None, AGENTGUARD_PUBLIC_KEY=None, AGENTGUARD_SECRET_KEY=None)
+        self.assertIn("Host: https://ag.example.com (from settings.json, used by new Claude Code sessions)", out)
+        self.assertIn("Public key: pk-ag-...3dd3 (from settings.json, used by new Claude Code sessions)", out)
+        self.assertIn("Secret key: set (ends ...cafe) (from settings.json, used by new Claude Code sessions)", out)
+        self.assertIn("Timeout: 20s", out)
+        self.assertNotIn("Keys are not set", out)
+        self.assertNotIn("restart Claude Code", out)  # normal in a terminal
+        with open(os.path.join(self.claude_dir, "settings.json")) as fh:
+            self.assertEqual(json.load(fh), settings)  # read only
+
+    def test_settings_only_inside_claude_code_says_restart(self):
+        settings = {"env": {"AGENTGUARD_PUBLIC_KEY": self.FILE_PK, "AGENTGUARD_SECRET_KEY": self.FILE_SK}}
+        out, _ = self.status(settings, CLAUDECODE="1", AGENTGUARD_PUBLIC_KEY=None, AGENTGUARD_SECRET_KEY=None)
+        self.assertIn("not in this Claude Code session: restart Claude Code", out)
+
+    def test_keys_in_both_environment_wins(self):
+        settings = {"env": {"AGENTGUARD_PUBLIC_KEY": self.FILE_PK, "AGENTGUARD_SECRET_KEY": self.FILE_SK}}
+        out, _ = self.status(settings, AGENTGUARD_PUBLIC_KEY=self.ENV_PK, AGENTGUARD_SECRET_KEY=self.ENV_SK)
+        self.assertIn("Public key: pk-ag-...aaaa (from the environment)", out)
+        self.assertIn("Secret key: set (ends ...bbbb) (from the environment)", out)
+        self.assertIn("Note: settings.json has a different public key", out)
+        self.assertIn("Note: settings.json has a different secret key", out)
+
+    def test_same_keys_in_both_no_note(self):
+        settings = {"env": {"AGENTGUARD_PUBLIC_KEY": self.ENV_PK, "AGENTGUARD_SECRET_KEY": self.ENV_SK}}
+        out, _ = self.status(settings, AGENTGUARD_PUBLIC_KEY=self.ENV_PK, AGENTGUARD_SECRET_KEY=self.ENV_SK)
+        self.assertNotIn("Note:", out)
+
+    def test_keys_in_neither(self):
+        out, _ = self.status({"env": {"FOO": "1"}}, AGENTGUARD_HOST=None, AGENTGUARD_PUBLIC_KEY=None, AGENTGUARD_SECRET_KEY=None)
+        self.assertIn("Host: https://ag-dev.actaclad.com (default)", out)
+        self.assertIn("Public key: (not set)", out)
+        self.assertIn("Secret key: (not set)", out)
+        self.assertIn("Keys are not set: run /agentguard:setup", out)
+
+    def test_broken_settings_json(self):
+        for raw in ("{ not json", "[1, 2]", '{"env": "oops"}'):
+            out, before = self.status(raw_settings=raw, AGENTGUARD_PUBLIC_KEY=None, AGENTGUARD_SECRET_KEY=None)
+            self.assertIn("WARNING: could not read", out, raw)
+            self.assertIn("Keys are not set", out, raw)
+            self.assertEqual(before, raw)  # untouched
+
+
+class CollectorDetectionTests(Base):
+    """Old OpenTelemetry collector on the OTLP/HTTP port: found with a socket connect plus a
+    fake docker on PATH (a sh script, or docker.cmd on Windows). Never stopped, only reported."""
+
+    def setUp(self):
+        super().setUp()
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(5)
+        self.port = self.listener.getsockname()[1]
+        self.mod.OTEL_COLLECTOR_PORT = self.port
+        self.bin = os.path.join(self.tmp, "fakebin")
+        os.makedirs(self.bin)
+        self.docker_out = os.path.join(self.tmp, "docker-out.txt")
+        self.docker_mark = os.path.join(self.tmp, "docker-called")
+
+    def tearDown(self):
+        self.listener.close()
+        super().tearDown()
+
+    def fake_docker(self, lines, exit_code=0):
+        with open(self.docker_out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(l + "\n" for l in lines))
+        if os.name == "nt":
+            path = os.path.join(self.bin, "docker.cmd")
+            with open(path, "w", newline="\r\n") as fh:
+                fh.write('@echo off\necho %%*>>"%s"\ntype "%s"\nexit /b %d\n' % (self.docker_mark, self.docker_out, exit_code))
+        else:  # shell builtins only: PATH holds nothing else
+            path = os.path.join(self.bin, "docker")
+            with open(path, "w") as fh:
+                fh.write('#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nwhile IFS= read -r l; do printf "%%s\\n" "$l"; done < "%s"\nexit %d\n' % (self.docker_mark, self.docker_out, exit_code))
+            os.chmod(path, 0o755)
+
+    def advice(self, path=None):
+        with mock.patch.dict(os.environ, {"PATH": self.bin if path is None else path}):
+            return self.mod.collector_advice()
+
+    def expected_cd(self, workdir):
+        if os.name == "nt":
+            return "  cd '%s'; docker compose down" % workdir.replace("'", "''")
+        return "  cd '%s' && docker compose down" % workdir.replace("'", "'\\''")
+
+    def test_compose_project_gives_cd_and_down(self):
+        workdir = os.path.join(self.tmp, "old setup", "claude's telemetry")
+        self.fake_docker(["claude-telemetry-otel-collector-1\t0.0.0.0:%d->4318/tcp, [::]:%d->4318/tcp\t%s" % (self.port, self.port, workdir)])
+        lines = self.advice()
+        self.assertIn("WARNING: an OpenTelemetry collector is still running (container claude-telemetry-otel-collector-1). Stop it with:", lines)
+        self.assertIn(self.expected_cd(workdir), lines)
+        self.assertIn("only in the folder shown", lines[-1])
+
+    def test_port_ranges_and_other_ports(self):
+        p = self.mod.publishes_port
+        self.assertTrue(p("0.0.0.0:4318->4318/tcp", 4318))
+        self.assertTrue(p("0.0.0.0:4317-4319->4317-4319/tcp", 4318))
+        self.assertTrue(p("[::]:4318->4318/tcp", 4318))
+        self.assertFalse(p("0.0.0.0:14318->4318/tcp", 4318))  # host port differs
+        self.assertFalse(p("4318/tcp", 4318))  # exposed, not published
+        self.assertFalse(p("0.0.0.0:5432->5432/tcp", 4318))
+        self.assertFalse(p("", 4318))
+
+    def test_no_compose_label_gives_stop_and_restart_no(self):
+        self.fake_docker(["otel\t0.0.0.0:%d->4318/tcp\t" % self.port])
+        lines = self.advice()
+        self.assertEqual(lines[:3], ["WARNING: an OpenTelemetry collector is still running (container otel). Stop it with:", "  docker stop otel", "  docker update --restart=no otel"])
+
+    def test_one_command_per_compose_project(self):
+        self.fake_docker(["a-1\t0.0.0.0:%d->4318/tcp\t/srv/otel" % self.port, "b-1\t127.0.0.1:%d->4318/tcp\t/srv/otel" % self.port, "db\t0.0.0.0:5432->5432/tcp\t/srv/other"])
+        lines = self.advice()
+        self.assertEqual([l for l in lines if "docker compose down" in l and l.startswith("  cd")], [self.expected_cd("/srv/otel")])
+        self.assertIn("(container a-1, b-1)", " ".join(lines))
+        self.assertNotIn("/srv/other", " ".join(lines))
+
+    def test_listening_but_no_matching_container(self):
+        self.fake_docker(["db\t0.0.0.0:5432->5432/tcp\t/srv/db"])
+        lines = self.advice()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("something is listening on 127.0.0.1:%d" % self.port, lines[0])
+        self.assertIn("docker-compose.yml, and nowhere else", lines[0])
+
+    def test_docker_missing_or_failing_is_quiet(self):
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        self.assertEqual(len(self.advice(path=empty)), 1)  # only the generic note
+        self.fake_docker(["garbage"], exit_code=1)
+        self.assertEqual(len(self.advice()), 1)
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=OSError("no docker daemon")):
+            self.assertEqual(len(self.advice()), 1)
+
+    def test_nothing_listening_means_no_output_and_no_docker_call(self):
+        self.listener.close()
+        self.fake_docker(["otel\t0.0.0.0:%d->4318/tcp\t/srv/otel" % self.port])
+        self.assertEqual(self.advice(), [])
+        self.assertFalse(os.path.exists(self.docker_mark))
+
+    def test_status_and_setup_print_it_and_never_run_compose(self):
+        self.fake_docker(["otel-1\t0.0.0.0:%d->4318/tcp\t/srv/otel" % self.port])
+        out = io.StringIO()
+        env = {"PATH": self.bin, "AGENTGUARD_HOME": self.home, "CLAUDE_CONFIG_DIR": self.claude_dir,
+               "AGENTGUARD_PUBLIC_KEY": self.server.public_key, "AGENTGUARD_SECRET_KEY": self.server.secret_key, "AGENTGUARD_HOST": self.server.url}
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdout", out):
+            self.mod.status_main()
+        self.assertIn(self.expected_cd("/srv/otel"), out.getvalue())
+        out = io.StringIO()
+        stdin = mock.Mock()
+        stdin.buffer = io.BytesIO((self.server.secret_key + "\n").encode())
+        stdin.isatty = lambda: False
+        with mock.patch.dict(os.environ, env), mock.patch.object(sys, "stdout", out), mock.patch.object(sys, "stdin", stdin):
+            code = self.mod.main(["--setup", "--host", self.server.url, "--public-key", self.server.public_key, "--secret-stdin"])
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn(self.expected_cd("/srv/otel"), out.getvalue())
+        # docker was only ever asked to list containers: nothing was stopped or removed
+        with open(self.docker_mark) as fh:
+            calls = [c.strip() for c in fh.read().splitlines() if c.strip()]
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assertTrue(call.startswith("ps --format"), call)
 
 
 class WindowsCodePathTests(unittest.TestCase):

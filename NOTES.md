@@ -179,7 +179,7 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
 - Stop does not fire when the user interrupts a turn. Its data goes out on the next Stop or
   SessionEnd.
 - The first run on a long existing session sends its whole history. Progress is committed per
-  batch inside the 3 s HTTP budget, so a large backlog takes a few hook runs to drain.
+  batch inside the HTTP time budget (`AGENTGUARD_TIMEOUT_SECONDS`, 15 by default since 0.1.1), so a large backlog takes a few hook runs to drain.
 - A subagent whose `Agent` call has not been seen yet is held back (its offset does not move)
   until it has, except on SessionEnd. There, the subagent gets its own trace instead of being
   dropped.
@@ -343,4 +343,48 @@ One JSON object per line, append-only. The main file is `<session_id>.jsonl`.
   are public, by `.github/scripts/annotate_failures.py`. The shells and Pythons found on
   PATH are written as a notice. The fake server no longer prints a traceback when a timed-out
   client hangs up (Windows `ConnectionAbortedError`). `actions/checkout@v5`; uv cache off.
+
+## 9. Changes in 0.1.1
+
+- **Timeout.** `HTTP_BUDGET_SECONDS = 3.0` was too short: AgentGuard's ingestion endpoint
+  sometimes takes longer to answer. The data then arrived, but the plugin recorded
+  `TimeoutError`, kept the offset, and re-sent the same data on every run (seen in a real
+  error log: two `TimeoutError` lines). It is now `AGENTGUARD_TIMEOUT_SECONDS` (default 15,
+  range 1 to 60), parsed by `parse_timeout`. An invalid value gives the default plus a warning
+  that is logged once per distinct value (`state["timeout_warning"]`). Each request still gets
+  only the time left in the budget. The lock wait grows with the budget (budget + 20 s), so a
+  second run does not give up while the first is still within its budget. The hook's own
+  `timeout` in `hooks.json` went from 10 to 90 s: otherwise Claude Code would cancel a
+  debug-mode (foreground) send before the budget ends. SessionEnd's 1.5 s limit is unaffected,
+  because in normal mode the hook returns at once.
+- **Status reads settings.json.** Claude Code passes the `env` block of `settings.json` only
+  to its own sessions, so `--status` in a terminal always said "not set". `status_config`
+  takes each `AGENTGUARD_*` setting from the environment first, else from settings.json
+  (read only), and status prints the source per value. `CLAUDECODE=1` (documented: set in
+  every subprocess Claude Code starts) tells a Claude Code session apart from a terminal. Only
+  inside a session do keys found only in settings.json mean "restart Claude Code". When
+  settings.json holds a different key than the environment, status says new sessions will
+  use that one. A broken settings.json gives a warning, never a crash or a write.
+- **Collector detection.** `collector_advice()` first tries a 0.3 s connect to
+  127.0.0.1:4318. Only if that succeeds does it run `docker ps --format` with the name, the
+  ports and the `com.docker.compose.project.working_dir` label. It matches containers that
+  publish 4318 on the host, port ranges included, and prints one command per Compose project:
+  `cd '<dir>' && docker compose down` on POSIX, `cd '<dir>'; docker compose down` in
+  PowerShell on Windows, with the path quoted for that shell. Without a label it prints
+  `docker stop` plus `docker update --restart=no`. It only prints: docker is asked for `ps`
+  and nothing else (a test checks the fake docker's argument log). A missing docker, docker
+  errors, timeouts, or nothing on the port produce no error output. The skills tell Claude
+  never to run the docker commands itself.
+- **HTTP 403 hint.** A 403 used to add "(check AGENTGUARD_PUBLIC_KEY / AGENTGUARD_SECRET_KEY)".
+  A real 403 said "Your organization's plan has ended": the keys were fine. 401 keeps the key
+  hint; 403 now says AgentGuard refused the data and to see its message.
+- **Docs.** The README install section leads with `claude plugin marketplace add` and
+  `claude plugin install` from a terminal, because `/plugin` does not work in the VS Code chat
+  panel. Setup runs through the launcher in the newest version folder: `ls -dt ... | head -1`
+  on POSIX, `Sort-Object LastWriteTime` in PowerShell, so there is no hardcoded version. The
+  POSIX form was checked against a real install. The README also gains Update, Old
+  OpenTelemetry setup, new troubleshooting rows, and the timeout setting.
+- **Release.** Version 0.1.1 in `plugin.json`, `marketplace.json` and `PLUGIN_VERSION`, so
+  `claude plugin update` sees it. Added `LICENSE` (Apache 2.0, the canonical text, sha256
+  `cfc7749b...3d30`), `"license": "Apache-2.0"` in plugin.json, and `CHANGELOG.md`.
 

@@ -24,6 +24,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -40,7 +42,7 @@ try:  # Windows
 except ImportError:
     msvcrt = None
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 
 # ---------------------------------------------------------------------------
 # Usage keys. These names must match the usage keys in AgentGuard's model price
@@ -67,13 +69,18 @@ TRACE_NAME = "claude_code.turn"
 GENERATION_NAME = "claude_code.llm_call"
 TRACE_TAGS = ["claude-code"]
 DEFAULT_HOST = "https://ag-dev.actaclad.com"
-HTTP_BUDGET_SECONDS = 3.0  # total for all HTTP requests in one run
+# Total time for all HTTP requests in one run (AGENTGUARD_TIMEOUT_SECONDS). Sending happens in
+# a detached background process, so a long budget never slows Claude Code down; AgentGuard's
+# ingestion endpoint sometimes needs more than a few seconds to answer.
+DEFAULT_TIMEOUT_SECONDS = 15.0
+MIN_TIMEOUT_SECONDS = 1.0
+MAX_TIMEOUT_SECONDS = 60.0
 MAX_BATCH_EVENTS = 500
 MAX_BATCH_BYTES = 3 * 1024 * 1024  # the server accepts 4.5 MB
 STATE_RETENTION_DAYS = 7
 ERROR_LOG_MAX_BYTES = 1024 * 1024
 DEFAULT_MAX_CONTENT_CHARS = 2000
-LOCK_WAIT_SECONDS = 20.0
+LOCK_WAIT_EXTRA_SECONDS = 20.0  # a waiting run allows the current one its whole budget plus this
 AGENT_TOOL_NAMES = ("Agent", "Task")
 # The only hook input fields the worker reads. The rest (Stop's last_assistant_message can be
 # megabytes) must not be passed on: the payload travels in an environment variable, and
@@ -132,6 +139,22 @@ def env_true(name):
     return (os.environ.get(name) or "").strip().lower() in TRUE_VALUES
 
 
+def parse_timeout(raw):
+    """AGENTGUARD_TIMEOUT_SECONDS -> (seconds, warning or None). Unset means the default;
+    text that is not a number, or a number outside 1 to 60, also gives the default, with a
+    warning that the worker logs once."""
+    if raw is None or not str(raw).strip():
+        return DEFAULT_TIMEOUT_SECONDS, None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = None
+    if value is None or value != value or not (MIN_TIMEOUT_SECONDS <= value <= MAX_TIMEOUT_SECONDS):
+        return DEFAULT_TIMEOUT_SECONDS, "AGENTGUARD_TIMEOUT_SECONDS=%r is not a number from %g to %g; using %g" % (
+            str(raw)[:40], MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_SECONDS)
+    return value, None
+
+
 class Config(object):
     def __init__(self, env=None):
         env = os.environ if env is None else env
@@ -145,6 +168,7 @@ class Config(object):
             self.max_content_chars = max(100, int(env.get("AGENTGUARD_MAX_CONTENT_CHARS") or DEFAULT_MAX_CONTENT_CHARS))
         except ValueError:
             self.max_content_chars = DEFAULT_MAX_CONTENT_CHARS
+        self.timeout, self.timeout_warning = parse_timeout(env.get("AGENTGUARD_TIMEOUT_SECONDS"))
 
     @property
     def has_keys(self):
@@ -362,7 +386,7 @@ def cleanup_state(st, now=None):
 
 
 @contextmanager
-def file_lock(path, wait=LOCK_WAIT_SECONDS):
+def file_lock(path, wait=DEFAULT_TIMEOUT_SECONDS + LOCK_WAIT_EXTRA_SECONDS):
     """Exclusive lock on path. Yields True when acquired, False after waiting `wait` seconds."""
     ensure_dir(os.path.dirname(path))
     fh = open(path, "a+")
@@ -405,7 +429,7 @@ def auth_header(cfg):
     return "Basic " + token
 
 
-def http_request(cfg, method, path, body=None, timeout=HTTP_BUDGET_SECONDS):
+def http_request(cfg, method, path, body=None, timeout=DEFAULT_TIMEOUT_SECONDS):
     """Returns (status, parsed_json_or_text). Raises on network errors and timeouts."""
     data = None
     headers = {
@@ -454,9 +478,10 @@ def split_batches(events):
 class Sender(object):
     """Sends ingestion batches within one shared time budget."""
 
-    def __init__(self, cfg, budget=HTTP_BUDGET_SECONDS):
+    def __init__(self, cfg, budget=None):
         self.cfg = cfg
-        self.deadline = time.monotonic() + budget
+        self.budget = cfg.timeout if budget is None else budget
+        self.deadline = time.monotonic() + self.budget
         self.last = None  # dict recorded as state["last_send"]
         self.sent_events = 0
 
@@ -469,7 +494,7 @@ class Sender(object):
         for batch in split_batches(events):
             remaining = self.deadline - time.monotonic()
             if remaining <= 0.05:
-                self._record(False, None, "time budget (%.1fs) used up; the rest is retried next run" % HTTP_BUDGET_SECONDS, len(batch))
+                self._record(False, None, "time budget (%gs, AGENTGUARD_TIMEOUT_SECONDS) used up; the rest is retried next run" % self.budget, len(batch))
                 log_error(self.last["detail"])
                 return False
             try:
@@ -480,7 +505,9 @@ class Sender(object):
                 return False
             if status < 200 or status >= 300:
                 msg = body.get("message") if isinstance(body, dict) else body
-                hint = " (check AGENTGUARD_PUBLIC_KEY / AGENTGUARD_SECRET_KEY)" if status in (401, 403) else ""
+                # 401: the keys are wrong. 403: the keys work but AgentGuard refuses the data
+                # (for example the organization's plan ended); its message says why.
+                hint = {401: " (check AGENTGUARD_PUBLIC_KEY / AGENTGUARD_SECRET_KEY)", 403: " (AgentGuard refused the data; see its message)"}.get(status, "")
                 self._record(False, status, "HTTP %s: %s%s" % (status, str(msg)[:200], hint), len(batch))
                 log_error("send failed: " + self.last["detail"])
                 return False
@@ -1080,12 +1107,17 @@ def process_session(cfg, payload, st, sender):
 
 
 def run_worker(payload, cfg):
-    with file_lock(os.path.join(data_dir(), "state.lock")) as acquired:
+    wait = cfg.timeout + LOCK_WAIT_EXTRA_SECONDS
+    with file_lock(os.path.join(data_dir(), "state.lock"), wait=wait) as acquired:
         if not acquired:
-            log_error("another run held the lock for %.0fs; this run is skipped (its data goes next time)" % LOCK_WAIT_SECONDS)
+            log_error("another run held the lock for %.0fs; this run is skipped (its data goes next time)" % wait)
             return
         st = load_state()
         cleanup_state(st)
+        # A bad AGENTGUARD_TIMEOUT_SECONDS is logged once per distinct value, not on every run.
+        if cfg.timeout_warning and st.get("timeout_warning") != cfg.timeout_warning:
+            log_error(cfg.timeout_warning)
+        st["timeout_warning"] = cfg.timeout_warning
         sender = Sender(cfg)
         ok = True
         try:
@@ -1193,24 +1225,77 @@ def otel_vars(settings_env, process_env):
     return in_settings, in_process
 
 
+# Every setting the plugin reads. --status shows them from the environment first, and from the
+# env block of settings.json when the environment lacks them (as in a plain terminal).
+SETTING_NAMES = (
+    "AGENTGUARD_HOST", "AGENTGUARD_PUBLIC_KEY", "AGENTGUARD_SECRET_KEY", "AGENTGUARD_LOG_CONTENT",
+    "AGENTGUARD_MAX_CONTENT_CHARS", "AGENTGUARD_USER", "AGENTGUARD_DEBUG", "AGENTGUARD_TIMEOUT_SECONDS",
+)
+SOURCE_NOTES = {
+    "environment": "from the environment",
+    "settings.json": "from settings.json, used by new Claude Code sessions",
+}
+
+
+def setting_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (str, int, float)):
+        return str(value).strip()
+    return ""
+
+
+def status_config(settings_env, environ=None):
+    """Config as --status shows it, and where each setting came from. The environment wins;
+    a setting missing there is read from settings.json's env block (read only), because Claude
+    Code passes that block only to its own sessions, not to a terminal."""
+    environ = os.environ if environ is None else environ
+    merged, sources = {}, {}
+    for name in SETTING_NAMES:
+        if setting_text(environ.get(name)):
+            merged[name], sources[name] = setting_text(environ.get(name)), "environment"
+        elif setting_text(settings_env.get(name)):
+            merged[name], sources[name] = setting_text(settings_env.get(name)), "settings.json"
+    return Config(merged), sources
+
+
+def mask_secret(value):
+    if not value:
+        return "(not set)"
+    return "set (ends ...%s)" % value[-4:] if len(value) > 8 else "set"
+
+
 def status_main():
-    cfg = Config()
     try:
-        settings_env = (read_settings().get("env") or {})
+        settings_env = read_settings().get("env") or {}
+        if not isinstance(settings_env, dict):
+            raise ValueError('"env" is not a JSON object')
+        settings_error = None
     except Exception as exc:
-        settings_env = {}
-        print("WARNING: could not read %s: %s" % (settings_path(), exc))
+        settings_env, settings_error = {}, exc
+    cfg, sources = status_config(settings_env)
+
+    def source(name, default=""):
+        return " (%s)" % SOURCE_NOTES[sources[name]] if name in sources else default
+
     print("AgentGuard plugin %s" % PLUGIN_VERSION)
     print("Python: %s (%s)" % (sys.executable, sys.version.split()[0]))
-    print("Host: %s" % cfg.host)
-    print("Public key: %s" % mask(cfg.public_key))
-    print("Secret key: %s" % ("set (ends ...%s)" % cfg.secret_key[-4:] if len(cfg.secret_key) > 8 else ("set" if cfg.secret_key else "(not set)")))
+    if settings_error is not None:
+        print("WARNING: could not read %s: %s" % (settings_path(), settings_error))
+    print("Host: %s%s" % (cfg.host, source("AGENTGUARD_HOST", " (default)")))
+    print("Public key: %s%s" % (mask(cfg.public_key), source("AGENTGUARD_PUBLIC_KEY")))
+    print("Secret key: %s%s" % (mask_secret(cfg.secret_key), source("AGENTGUARD_SECRET_KEY")))
+    key_names = ("AGENTGUARD_PUBLIC_KEY", "AGENTGUARD_SECRET_KEY")
     if not cfg.has_keys:
-        if settings_env.get("AGENTGUARD_PUBLIC_KEY") and settings_env.get("AGENTGUARD_SECRET_KEY"):
-            print("Keys are in %s but not in this session: restart Claude Code." % settings_path())
-        else:
-            print("Keys are not set: run /agentguard:setup. Until then nothing is sent.")
+        print("Keys are not set: run /agentguard:setup. Until then nothing is sent.")
+    elif os.environ.get("CLAUDECODE") == "1" and any(sources.get(n) == "settings.json" for n in key_names):
+        print("These keys are in settings.json but not in this Claude Code session: restart Claude Code to use them.")
+    for name in key_names:  # environment wins; say so when settings.json would give new sessions another key
+        other = setting_text(settings_env.get(name))
+        if sources.get(name) == "environment" and other and other != setting_text(os.environ.get(name)):
+            print("Note: settings.json has a different %s; new Claude Code sessions will use that one." % ("public key" if name.endswith("PUBLIC_KEY") else "secret key"))
     print("Content logging: %s (max %d chars per field)" % ("ON" if cfg.log_content else "off", cfg.max_content_chars))
+    print("Timeout: %gs for all requests in one send (AGENTGUARD_TIMEOUT_SECONDS)%s" % (cfg.timeout, "; WARNING: " + cfg.timeout_warning if cfg.timeout_warning else ""))
     print("User id: %s" % (cfg.user or "from git config user.email, else OS user"))
     st = load_state()
     last = st.get("last_send")
@@ -1222,6 +1307,7 @@ def status_main():
     s_otel, p_otel = otel_vars(settings_env, os.environ)
     if s_otel or p_otel:
         print("WARNING: old OpenTelemetry settings found (they cause duplicate traces): %s" % ", ".join(s_otel + p_otel))
+    print_collector_advice()
     print("Error log: %s" % error_log_path())
     try:
         with open(error_log_path(), "r", encoding="utf-8") as fh:
@@ -1232,6 +1318,104 @@ def status_main():
     except OSError:
         print("Error log: empty")
     return 0
+
+
+# The old setup ran an OpenTelemetry collector in Docker, listening for OTLP over HTTP on
+# localhost:4318. While it runs, sessions reach AgentGuard twice.
+OTEL_COLLECTOR_PORT = 4318
+COMPOSE_DIR_LABEL = "com.docker.compose.project.working_dir"
+
+
+def port_open(port, host="127.0.0.1", timeout=0.3):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def publishes_port(ports, port):
+    """True if a `docker ps` Ports column publishes `port` on the host, for example
+    "0.0.0.0:4318->4318/tcp" or "0.0.0.0:4317-4318->4317-4318/tcp"."""
+    for match in re.finditer(r":(\d+)(?:-(\d+))?->", ports or ""):
+        low = int(match.group(1))
+        high = int(match.group(2) or low)
+        if low <= port <= high:
+            return True
+    return False
+
+
+def docker_containers_on_port(port):
+    """[(container name, compose working dir or "")] for running containers that publish
+    `port`. Empty when docker is missing, fails, or is slow: this check must never get in
+    the way."""
+    docker = shutil.which("docker")
+    if not docker:
+        return []
+    fmt = "{{.Names}}\t{{.Ports}}\t{{.Label \"%s\"}}" % COMPOSE_DIR_LABEL
+    extra = {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
+    try:
+        proc = subprocess.run([docker, "ps", "--format", fmt], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5, **extra)
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    found = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.strip("\r").split("\t")
+        if len(parts) >= 2 and parts[0].strip() and publishes_port(parts[1], port):
+            found.append((parts[0].strip(), parts[2].strip() if len(parts) > 2 else ""))
+    return found
+
+
+def quote_path(path):
+    if IS_WINDOWS:  # PowerShell single quotes: a quote inside is doubled
+        return "'%s'" % path.replace("'", "''")
+    return "'%s'" % path.replace("'", "'\\''")
+
+
+def collector_advice(port=None):
+    """Lines telling the user how to stop a still-running old collector; [] if nothing
+    listens on its port. Only prints instructions: it never stops anything itself."""
+    port = OTEL_COLLECTOR_PORT if port is None else port
+    if not port_open(port):
+        return []
+    containers = docker_containers_on_port(port)
+    if not containers:
+        return [
+            "WARNING: something is listening on 127.0.0.1:%d, the port of the old OpenTelemetry collector. "
+            "If it is that collector, it makes every session appear twice: stop it from the folder that has "
+            "its docker-compose.yml, and nowhere else." % port
+        ]
+    lines = []
+    projects = []  # compose working dirs, in order, each with its container names
+    for name, workdir in containers:
+        if workdir:
+            for entry in projects:
+                if entry[0] == workdir:
+                    entry[1].append(name)
+                    break
+            else:
+                projects.append((workdir, [name]))
+        else:
+            lines.append("WARNING: an OpenTelemetry collector is still running (container %s). Stop it with:" % name)
+            lines.append("  docker stop %s" % name)
+            lines.append("  docker update --restart=no %s" % name)
+    join = "; " if IS_WINDOWS else " && "
+    for workdir, names in projects:
+        lines.append("WARNING: an OpenTelemetry collector is still running (container %s). Stop it with:" % ", ".join(names))
+        lines.append("  cd %s%sdocker compose down" % (quote_path(workdir), join))
+    lines.append("It makes every session appear twice. This plugin never stops containers itself; "
+                 "run \"docker compose down\" only in the folder shown, because in any other folder it stops a different project.")
+    return lines
+
+
+def print_collector_advice():
+    try:
+        for line in collector_advice():
+            print(line)
+    except Exception:
+        pass  # never let this check break status or setup
 
 
 def check_otel_main():
@@ -1248,7 +1432,7 @@ def check_otel_main():
 def test_keys(cfg):
     """Returns (ok, message)."""
     try:
-        status, body = http_request(cfg, "GET", "/api/public/projects", timeout=10)
+        status, body = http_request(cfg, "GET", "/api/public/projects", timeout=cfg.timeout)
     except Exception as exc:
         return False, "could not reach %s: %s: %s" % (cfg.host, type(exc).__name__, exc)
     if status == 200:
@@ -1366,6 +1550,7 @@ def setup_main(args):
         print("WARNING: old OpenTelemetry settings are still in settings.json and will cause duplicate traces: %s" % ", ".join(s_otel))
     if p_otel:
         print("WARNING: these OpenTelemetry variables come from your shell or another settings file; remove them there: %s" % ", ".join(p_otel))
+    print_collector_advice()
     print("Restart Claude Code so the hooks see the new keys.")
     return 0
 

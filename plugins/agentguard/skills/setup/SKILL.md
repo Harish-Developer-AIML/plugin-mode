@@ -76,11 +76,13 @@ replace `<options>` with the options given in each step:
    not be read or written (nothing was written). On 3, show the message and ask the user to
    check the keys and host.
 
-5. **OpenTelemetry outside settings.json.** If anything is listed under
-   `elsewhere_in_environment`, tell the user those variables come from their shell profile,
-   their Windows user environment variables, or another settings file, and that they should
-   remove them there. If they used the old Docker collector setup (`claude-telemetry` with
-   `docker-compose.yml`), they can stop and remove it: `docker compose down` in that folder.
+5. **Old OpenTelemetry setup.** If anything is listed under `elsewhere_in_environment`, tell
+   the user those variables come from their shell profile, their Windows user environment
+   variables, or another settings file, and that they should remove them there. If `--status`
+   or `--setup` printed "an OpenTelemetry collector is still running" or "something is
+   listening on 127.0.0.1:4318", show the user the printed command unchanged. Say that
+   `docker compose down` must be run only in the folder shown, because in another folder it
+   stops a different project. **Never run docker commands yourself**: the user decides.
 
 6. **Finish.** Tell the user to **restart Claude Code**, because the hooks only see the new
    keys in a new session. After that, every session appears in AgentGuard under their git

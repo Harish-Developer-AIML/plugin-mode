@@ -6,7 +6,49 @@ Prompt and response text is sent only if you turn it on.
 
 ## Install
 
-In Claude Code:
+You need **Python 3.8 or newer** (see [Supported platforms](#supported-platforms)) and the
+AgentGuard **host, public key and secret key** for your project.
+
+### From a terminal (Claude Code CLI and VS Code extension)
+
+Use a normal terminal for this. The `/plugin` chat commands do not work in the VS Code
+extension's chat panel.
+
+**macOS, Linux, WSL:**
+
+```sh
+claude plugin marketplace add Harish-Developer-AIML/plugin-mode
+claude plugin install agentguard@actaclad
+sh "$(ls -dt ~/.claude/plugins/cache/actaclad/agentguard/*/ | head -1)scripts/agentguard.sh" --setup
+```
+
+**Windows (PowerShell):**
+
+```powershell
+claude plugin marketplace add Harish-Developer-AIML/plugin-mode
+claude plugin install agentguard@actaclad
+$ag = Get-ChildItem "$env:USERPROFILE\.claude\plugins\cache\actaclad\agentguard" -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$($ag.FullName)\scripts\agentguard.ps1" --setup
+```
+
+The last command picks the newest installed version folder, so you never type a version
+number. To see the folders yourself: `ls ~/.claude/plugins/cache/actaclad/agentguard/` (or
+`dir "$env:USERPROFILE\.claude\plugins\cache\actaclad\agentguard"` on Windows). If you set
+`CLAUDE_CONFIG_DIR`, the plugins are under that folder instead of `~/.claude`.
+
+Setup asks for the host (press Enter to keep `https://ag-dev.actaclad.com`), the public key
+and the secret key. **The secret key prompt is hidden: nothing appears while you paste or
+type it.** Press Enter after pasting. Setup checks the keys against AgentGuard before saving
+anything.
+
+**Then restart Claude Code.** In VS Code, quit VS Code completely (on macOS: Cmd+Q, not just
+closing the window), then start it again. On macOS, opening VS Code from a terminal with
+`code .` helps: VS Code then gets the terminal's `PATH` and finds the same Python as the
+terminal does. From then on, every session is sent automatically.
+
+### Alternative: chat commands in the Claude Code CLI
+
+In the Claude Code CLI (not the VS Code chat panel):
 
 ```
 /plugin marketplace add Harish-Developer-AIML/plugin-mode
@@ -14,11 +56,20 @@ In Claude Code:
 /agentguard:setup
 ```
 
-Then **restart Claude Code**. From then on, every session is sent automatically.
+Then restart Claude Code.
 
 The `@actaclad` in the install command is the marketplace's name from
 `.claude-plugin/marketplace.json`, not the GitHub owner, so it stays `actaclad` wherever the
 repository lives.
+
+## Update
+
+```sh
+claude plugin update agentguard@actaclad
+```
+
+Then restart Claude Code. If it says the plugin is already up to date but a newer version
+exists, refresh the marketplace first: `claude plugin marketplace update actaclad`.
 
 ## Supported platforms
 
@@ -33,15 +84,15 @@ It uses only Python's standard library, so there is nothing to `pip install`. It
 | Windows, native | Not included in Windows. Install it with `winget install Python.Python.3.12` or from [python.org](https://www.python.org/downloads/windows/), and tick **"Add python.exe to PATH"** in the installer. The `py` launcher that comes with it also works. Python from the Microsoft Store works too. | Works with or without Git for Windows. With it, the hooks run in Git Bash; without it, in PowerShell. The `python` / `python3` shortcuts Windows ships, which only open the Microsoft Store, are detected and never run. |
 | Windows, WSL | Install Python inside the WSL distribution, as on Linux. | Run Claude Code inside WSL. Settings are in the Linux home folder there (`~/.claude`), not the Windows one. |
 
-Without a suitable Python the plugin does nothing. Claude Code works normally, and
-`/agentguard:status` and `/agentguard:setup` say how to install Python.
+Without a suitable Python the plugin does nothing. Claude Code works normally, and the
+status and setup commands say how to install Python.
 
 On Windows, `~/.claude` below means `%USERPROFILE%\.claude`, for example
 `C:\Users\you\.claude\settings.json`.
 
 ## Set up your keys
 
-`/agentguard:setup` asks for three values:
+Setup (the terminal command above, or `/agentguard:setup`) asks for three values:
 
 | Value | Where to find it |
 |---|---|
@@ -49,10 +100,10 @@ On Windows, `~/.claude` below means `%USERPROFILE%\.claude`, for example
 | Public key (`pk-ag-...`) | AgentGuard → your project → Settings → API keys |
 | Secret key (`sk-ag-...`) | Shown once when the key is created |
 
-You can enter them in two ways:
+`/agentguard:setup` offers two ways to enter them:
 
-- **In your own terminal (recommended).** Setup gives you a one-line command that asks for
-  the secret key with a hidden prompt, so the key never appears in the chat.
+- **In your own terminal (recommended).** It gives you the terminal command above, which asks
+  for the secret key with a hidden prompt, so the key never appears in the chat.
 - **In the chat.** Quicker, but the secret key is then stored in that session's transcript
   on your machine and sent to the model provider.
 
@@ -61,16 +112,30 @@ Either way, setup checks the keys against AgentGuard before saving anything. It 
 `~/.claude/settings.json` and leaves your other settings alone. The previous file is kept as
 `~/.claude/settings.json.agentguard-backup`.
 
-### Remove the old Docker collector setup
+## Old OpenTelemetry setup
 
-If you used the earlier OpenTelemetry setup (a local Docker collector, `docker-compose.yml`,
-plus `CLAUDE_CODE_ENABLE_TELEMETRY` and `OTEL_*` settings), remove it. Otherwise every session
-appears in AgentGuard twice.
+If you used the earlier setup, with a local Docker OpenTelemetry collector, a
+`docker-compose.yml`, and `CLAUDE_CODE_ENABLE_TELEMETRY` / `OTEL_*` settings, remove it.
+While it runs, every session appears in AgentGuard twice.
 
-- Setup finds the `OTEL_*` and `CLAUDE_CODE_ENABLE_TELEMETRY` entries in
-  `~/.claude/settings.json` and offers to remove them.
-- If they are set in your shell profile (`~/.zshrc`, `~/.bashrc`), delete them there.
-- Stop and remove the collector: run `docker compose down` in its folder.
+- **Settings:** setup finds the `OTEL_*` and `CLAUDE_CODE_ENABLE_TELEMETRY` entries in
+  `~/.claude/settings.json` and offers to remove them. If they are set in your shell profile
+  (`~/.zshrc`, `~/.bashrc`) or in your Windows user environment variables, delete them there.
+- **The collector:** setup and status check whether something still listens on
+  `127.0.0.1:4318`, the collector's port. If Docker is available, they look up the container
+  and print the exact command to stop it, for example:
+
+  ```
+  WARNING: an OpenTelemetry collector is still running (container claude-telemetry-otel-collector-1). Stop it with:
+    cd '/Users/you/claude-telemetry' && docker compose down
+  ```
+
+  For a container that was not started with Docker Compose, they print `docker stop <name>`
+  and `docker update --restart=no <name>` instead. The plugin never stops or removes
+  containers itself.
+- **Run `docker compose down` only in the collector's own folder**, the one shown in that
+  message, which holds the collector's `docker-compose.yml`. In any other folder it stops
+  whatever project lives there instead.
 
 ## What is sent
 
@@ -114,7 +179,8 @@ All of these go in the `env` block of `~/.claude/settings.json`:
 | `AGENTGUARD_USER` | git email, then OS user | User id shown in AgentGuard |
 | `AGENTGUARD_LOG_CONTENT` | `false` | Also send prompt, response and tool text |
 | `AGENTGUARD_MAX_CONTENT_CHARS` | `2000` | Maximum length of each text field |
-| `AGENTGUARD_DEBUG` | `false` | Send in the foreground and print what happens (see below) |
+| `AGENTGUARD_TIMEOUT_SECONDS` | `15` | Total time one send may take, for all its requests together (1 to 60; another value falls back to 15 and logs a warning once). Sending happens in the background, so this never slows Claude Code down. |
+| `AGENTGUARD_DEBUG` | `false` | Send in the foreground and print what happens (see below). Each answer may then wait up to `AGENTGUARD_TIMEOUT_SECONDS`. |
 
 ## How it works
 
@@ -128,67 +194,75 @@ Code never waits for the network. The background process:
    in `~/.claude/agentguard/state.json`);
 2. turns them into traces, generations and spans, with ids derived from the transcript's own
    ids, so sending the same data twice updates it instead of duplicating it;
-3. sends them in batches, spending at most 3 seconds on the network in total.
+3. sends them in batches, within `AGENTGUARD_TIMEOUT_SECONDS` (15 by default) for the whole
+   send.
 
-If AgentGuard cannot be reached or refuses the keys, nothing is lost. The saved place does not
-move, and the same data is sent again after the next answer. Errors go to
+If AgentGuard cannot be reached, is too slow, or refuses the data, nothing is lost. The saved
+place does not move, and the same data is sent again after the next answer. Errors go to
 `~/.claude/agentguard/error.log` (1 MB, then rotated). Nothing is ever shown in Claude Code. The
 secret key is never written to the state file or the log.
 
 ## Troubleshooting
 
-Run `/agentguard:status`. It shows:
+Run `/agentguard:status`, or in a terminal:
 
-- whether the keys are set (masked),
+```sh
+# macOS, Linux, WSL, Git Bash
+sh "$(ls -dt ~/.claude/plugins/cache/actaclad/agentguard/*/ | head -1)scripts/agentguard.sh" --status
+```
+
+```powershell
+# Windows PowerShell
+$ag = Get-ChildItem "$env:USERPROFILE\.claude\plugins\cache\actaclad\agentguard" -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+powershell -NoProfile -ExecutionPolicy Bypass -File "$($ag.FullName)\scripts\agentguard.ps1" --status
+```
+
+It shows:
+
+- whether the keys are set (masked), and where they come from. In a terminal they come from
+  `settings.json`, because Claude Code passes its `env` block only to its own sessions.
+- the active timeout,
 - when data was last sent and whether it worked,
 - the last lines of `error.log`,
-- any old OpenTelemetry settings.
+- any old OpenTelemetry settings or a still-running collector.
 
 | Status says | Do this |
 |---|---|
-| Keys are not set | Run `/agentguard:setup` |
-| Keys are in settings.json but not in this session | Restart Claude Code |
-| `FAILED (HTTP 401)` or `403` | The keys are wrong or for another host. Run `/agentguard:setup` again. |
-| `FAILED: ... timed out` / connection refused | AgentGuard is unreachable from this machine (VPN, proxy, wrong host). Data waits and is sent later. |
-| `time budget used up` | A long backlog, for example the first run on a long session. It drains over the next few answers. |
+| `AgentGuard needs Python 3.8 or newer` | Install Python as shown under [Supported platforms](#supported-platforms), then restart Claude Code. |
+| Keys are not set | Run setup (see [Install](#install)). |
+| `restart Claude Code to use them` | Setup saved the keys after this session started. Restart Claude Code. |
+| `FAILED (HTTP 401)` | The keys are wrong or for another host. Run setup again. |
+| `FAILED (HTTP 403)` | The keys work but AgentGuard refused the data; its message says why (for example, the organization's plan has ended). Data waits and is sent once that is fixed. |
+| `FAILED: TimeoutError` / `timed out` | AgentGuard answered too slowly. Nothing is lost: the data is sent again after the next answer. If it keeps happening, raise `AGENTGUARD_TIMEOUT_SECONDS` (for example to `30`) in the settings `env` block and restart. |
+| `FAILED: ... ` connection refused / name not resolved | AgentGuard is unreachable from this machine (VPN, proxy, wrong host). Data waits and is sent later. |
+| `time budget ... used up` | A long backlog, for example the first run on a long session. It drains over the next few answers. |
 | `Last send: never` | Data goes out when an answer finishes. Ask Claude something, then check again. |
+| Sessions appear twice in AgentGuard | The old OpenTelemetry setup is still active. Status shows the settings and the collector, with the exact command to stop it (see [Old OpenTelemetry setup](#old-opentelemetry-setup)). |
+| Works in the terminal (`claude`) but not in VS Code | VS Code was not fully restarted, or it does not see your Python. Quit VS Code completely and start it again. On macOS, start it from a terminal with `code .`. Then run `/agentguard:status` in the VS Code chat: its `Python:` line shows which Python it uses. |
 
 For a closer look, set `"AGENTGUARD_DEBUG": "true"` in the settings `env` block and restart.
 Each send then runs in the foreground and prints to Claude Code's hook output (`claude --debug`
-or verbose mode). Turn it off afterwards, because in debug mode each answer waits for the send.
-
-You can also run the status check yourself:
-
-```
-# macOS, Linux, WSL, Git Bash
-sh ~/.claude/plugins/cache/actaclad/agentguard/<version>/scripts/agentguard.sh --status
-
-# Windows PowerShell or Command Prompt
-powershell -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\.claude\plugins\cache\actaclad\agentguard\<version>\scripts\agentguard.ps1" --status
-```
-
-In PowerShell, write `$env:USERPROFILE` instead of `%USERPROFILE%`.
-
-If status says **"AgentGuard needs Python 3.8 or newer"**, install Python as shown under
-[Supported platforms](#supported-platforms) and restart Claude Code.
+or verbose mode). Turn it off afterwards: in debug mode each answer waits for the send, up to
+`AGENTGUARD_TIMEOUT_SECONDS`.
 
 ## Uninstall
 
-```
-/plugin uninstall agentguard@actaclad
-/plugin marketplace remove actaclad
+```sh
+claude plugin uninstall agentguard@actaclad
+claude plugin marketplace remove actaclad
 ```
 
-Then remove `AGENTGUARD_HOST`, `AGENTGUARD_PUBLIC_KEY` and `AGENTGUARD_SECRET_KEY` from the
-`env` block of `~/.claude/settings.json`, and delete `~/.claude/agentguard/` (state and error
-log).
+(or `/plugin uninstall agentguard@actaclad` and `/plugin marketplace remove actaclad` in the
+Claude Code CLI). Then remove `AGENTGUARD_HOST`, `AGENTGUARD_PUBLIC_KEY` and
+`AGENTGUARD_SECRET_KEY` from the `env` block of `~/.claude/settings.json`, and delete
+`~/.claude/agentguard/` (state and error log).
 
 ## Development
 
 CI (`.github/workflows/tests.yml`) runs every test on ubuntu-latest, macos-latest and
 windows-latest with Python 3.8 and 3.12. That includes the hook command itself under sh, dash,
-bash, Git Bash, PowerShell 7 and Windows PowerShell 5.1, wherever the runner has them.
-
+bash, Git Bash, PowerShell 7 and Windows PowerShell 5.1, wherever the runner has them. Failed
+tests also appear as annotations on the run, which can be read without signing in.
 
 ```
 python3 -m unittest discover -s tests -v       # all tests, standard library only
@@ -202,18 +276,18 @@ To try a local checkout:
 
 ```
 git clone https://github.com/Harish-Developer-AIML/plugin-mode.git
-```
-
-Then, in Claude Code started from the folder that contains `plugin-mode`:
-
-```
-/plugin marketplace add ./plugin-mode
-/plugin install agentguard@actaclad
+claude plugin marketplace add ./plugin-mode
+claude plugin install agentguard@actaclad
 ```
 
 Alternatively, `claude --plugin-dir ./plugin-mode/plugins/agentguard` loads the plugin for one
 session without installing it.
 
-`NOTES.md` records how the transcript format, hook inputs and ingestion API were checked. To
-change which usage keys are sent (they must match AgentGuard's model price table), edit
-`USAGE_KEYS` and `SPLIT_CACHE_CREATION_BY_TTL` at the top of `send_trace.py`.
+`NOTES.md` records how the transcript format, hook inputs and ingestion API were checked, and
+`CHANGELOG.md` lists the changes per version. To change which usage keys are sent (they must
+match AgentGuard's model price table), edit `USAGE_KEYS` and `SPLIT_CACHE_CREATION_BY_TTL` at
+the top of `send_trace.py`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
