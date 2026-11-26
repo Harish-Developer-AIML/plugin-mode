@@ -684,8 +684,10 @@ class CodexWindowsNotifyTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_posix_uses_the_sh_launcher(self):
-        argv = self.mod.notify_argv("/home/dev/.agentguard/scripts", is_windows=False)
-        self.assertEqual(argv, ["/bin/sh", "/home/dev/.agentguard/scripts/agentguard.sh", "codex", "notify"])
+        scripts = "/home/dev/.agentguard/scripts"
+        argv = self.mod.notify_argv(scripts, is_windows=False)
+        # os.path.join, as the code: this case only runs for real on macOS and Linux
+        self.assertEqual(argv, ["/bin/sh", os.path.join(scripts, "agentguard.sh"), "codex", "notify"])
 
 
 @unittest.skipIf(os.name == "nt" or not shutil.which("sh"), "POSIX launcher")
